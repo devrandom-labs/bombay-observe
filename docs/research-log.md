@@ -5,6 +5,31 @@ benchmark distribution, allocations, retained memory, and decision for every
 experiment. The initial `Mutex<HashMap>` plus per-subject condition variable is
 a correctness baseline, not a preferred design.
 
+## Final state (TL;DR)
+
+The complete design is green, stable, and independently reviewed:
+
+- **Design**: `parking_lot::Mutex<Entries { map: SmallMap<K, SlotEntry>,
+  pool: Vec<Arc<Slot>> }>` key table (SmallMap = inline Vec <= 4 entries,
+  Eq-only scan, promoting to a fixed-seed FxHash HashMap) + `AtomicUsize`
+  generation counter + lock-free slot (single-word state `COMPLETED |
+  HAS_WAITER`, `UnsafeCell<Option<O>>` outcome, waiters under their own
+  mutex as `Thread | Waker`) + recycled-slot pool (retire-time
+  `strong_count == 1` proof, cap 128, stale-waiter drain at reset).
+- **Throughput**: ~50.5M observations/s stable (recorded best 54.5M;
+  run spread 46-55M is OS scheduling, see measurement caveat below),
+  +546% over the 7.8M baseline; zero allocations per op; 112 B retained per
+  subject+observer; hot path p50/p99 41/42 ns; wait round-trip p50 ~2-3 us.
+- **API**: `try_get` (lock-free), `wait`, `wait_timeout`, `register_waker`
+  (std `Waker`, async adapter hook), `into_outcome` (move-only), thiserror
+  errors; runnable adapter example in `examples/actorpass_adapter.rs`.
+- **Verification**: 11 in-lib loom models of the real implementation
+  (preemptions 3 and 7), Miri 12/12 on real-thread tests, full frozen gate
+  green, independent concurrency review: design sound, findings addressed.
+- The unsafe surface (the outcome cell + pool reuse) is documented below
+  with its invariants; any change to the state protocol must re-run loom
+  and Miri.
+
 ## Primary sources consulted
 
 - **Vyukov, "Eventcounts"** (lock-free condition variables; pioneered with
@@ -157,6 +182,33 @@ contract without changing the hot path:
 Primary unchanged (49.6M). std 9/9, loom 10/10 (into_outcome racing
 complete never torn), Miri 9/9, gate green.
 
+## Independent concurrency review (fresh-eyes, all findings addressed)
+
+A specialist reviewer audited the final design against the documented
+invariants. Verdict: the concurrency design is sound (overall confidence
+0.85) - every outcome-cell read is gated behind Acquire+ observation of
+COMPLETED, the single-word RMW total order closes both lost-wakeup
+interleavings, the pool recycle proof holds, and the SmallMap/promotion,
+drain-outside-lock, checked deadline arithmetic, and Relaxed generation
+counter are correct. Findings addressed:
+1. wait/wait_timeout deregister the current thread on early-return and
+   timeout paths and dedupe registrations across loop iterations - stale
+   Thread registrations cannot survive into pooled slots.
+2. Slot::reset drains the waiters Vec when HAS_WAITER is set (covers a
+   waker whose caller dropped its observation before completion) - bounded
+   retention is now exact (no dead waiter payloads in the pool, no
+   cross-generation spurious fires).
+3. wait_timeout Panics doc lists both panic sources (protocol violation,
+   Instant overflow) and the typo is fixed.
+4. register_waker_racing_complete_never_loses_outcome stress test (100x
+   real-thread race; the waker path is not loom-modelable - std Waker is
+   not a loom type).
+Acknowledged unfixable: tests/loom.rs is frozen (the gate diffs it) and
+models none of the crate; the real loom models live in src/loom_tests.rs.
+All fixes perf-neutral (3 direct runs 50.41-50.52M, identical to the
+pre-fix stable value). std 12/12, loom 11/11 at preemptions 3 and 7, Miri
+12/12, gate green.
+
 ## Quantified rejection: hazard-pointer lock-free observe
 
 The last remaining perf lever (removing the observe entries lock) was
@@ -226,18 +278,25 @@ entries lock stays on the observe path.
 | 12 | EXP10: SmallMap hybrid (inline Vec <=4, promotes to HashMap) | 49,685,943 | +536% | keep |
 | 13 | EXP11: into_outcome (move-only) + register_waker (async hook) | 49,630,870 | +535% | keep (perf-neutral contract completion) |
 | 14 | EXP12: wait_timeout(Duration) -> Option<O> (bounded blocking) | 50,468,410 | +546% | keep (perf-neutral API addition) |
+| 15 | adapter example (deliverable, no lib change) | 49,937,473 | +539% | keep |
+| 16 | EXP13: thiserror error types (compliance, perf-neutral) | 53,624,694 | +586% | keep |
+| 17 | const-capacity promotion (compliance, perf-neutral) | 54,523,894 | +598% | keep |
+| 18 | review fixes (stale-waiter deregistration + reset drain, perf-neutral) | 50,470,853 | +546% | keep |
 
 Final design: single `Mutex<Entries { map: SmallMap<K, SlotEntry>, pool:
 Vec<Arc<Slot>> }>` key table (parking_lot; SmallMap = inline Vec <= 4
 entries promoting to FxHash HashMap) + generation counter `AtomicUsize` +
 lock-free slot (single-word state: COMPLETED | HAS_WAITER;
-`UnsafeCell<Option<O>>`; waiters under their own `parking_lot::Mutex<Vec<Thread>>`)
-+ recycled-slot pool (retire-time strong-count proof, cap 128).
+`UnsafeCell<Option<O>>`; waiters under their own `parking_lot::Mutex<Vec<Waiter>>`,
+`Waiter = Thread | Waker`) + recycled-slot pool (retire-time strong-count
+proof, cap 128, stale-waiter drain at reset). API also provides
+`wait_timeout`, `register_waker`, and `into_outcome`; errors via thiserror.
 
-Final numbers (run #12): primary 49.69M; seq_observe_first 51.4M,
-seq_complete_first 49.6M, retire_recreate 70.1M, cancel 51.7M;
-fanout(8) 149.3M observations/s; hot path p50/p99 41/42 ns; wait round-trip
-p50/p99 2.3/6.1 us; contention 1t/4t/8t 51.6M/24.5M/12.0M; alloc 0 B / 0
+Final numbers (run #19, post-review-fix): primary ~50.5M stable (recorded
+best 54.5M at run #18); seq_observe_first 41.9-51.4M (noisy),
+seq_complete_first 47.8M, retire_recreate 71.5M, cancel 51.6M;
+fanout(8) 151.1M observations/s; hot path p50/p99 41/42 ns; wait round-trip
+p50/p99 ~2-3/6-8 us; contention 1t/4t/8t ~52M/~21M/~10M; alloc 0 B / 0
 blocks per op (pooled); retained 112 B / 1 block per subject+observer;
 after-drop residue 1088 B (no leak).
 
@@ -280,14 +339,18 @@ after-drop residue 1088 B (no leak).
 ## Remaining risks
 
 - The unsafe slot's correctness rests on the documented invariants; loom
-  models the real implementation (7 tests, preemptions 3 and 7) and Miri
-  passes the real-thread tests. Any future change to the state protocol must
+  models the real implementation (11 tests, preemptions 3 and 7) and Miri
+  passes 12 real-thread tests. Any future change to the state protocol must
   re-run both.
-- `wait()` on a subject that is never completed blocks forever (same as the
-  baseline Condvar design); no timeout API exists.
+- `wait()` (without a timeout) on a subject that is never completed blocks
+  forever; `wait_timeout` bounds the blocking, and `register_waker` is the
+  non-blocking alternative.
 - park/unpark wait is per-thread token-based; a thread waiting on two
   observations concurrently can consume a cross-wake token as a spurious
-  wakeup (harmless - the wait loop re-checks).
-- The primary metric is sensitive to CPU frequency state (measured
-  +/-3.5% run-to-run); best-of-5 and in-script ordering mitigate it.
+  wakeup (harmless - the wait loop re-checks). Registrations are deduped
+  and deregistered on early return/timeout, so the waiters Vec stays small.
+- The primary metric is sensitive to OS scheduling (E-core vs P-core for
+  the short frozen process); measured run-to-run spread ~46-55M (+/-10%),
+  mitigated by best-of-5 and in-script ordering. Relative comparisons
+  across experiments remain valid.
 
