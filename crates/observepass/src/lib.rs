@@ -174,11 +174,57 @@ impl<O> Slot<O> {
             unsafe { *ptr = Some(outcome) };
         });
     }
+
+    /// Clear the outcome cell.
+    ///
+    /// # Safety
+    /// No reader can observe the cell (a pooled slot has no observers; the
+    /// write is published by the subsequent Release store of `state`).
+    #[cfg(not(loom))]
+    unsafe fn clear_outcome(&self) {
+        // SAFETY: no concurrent readers (pooled-slot invariant).
+        unsafe { *self.outcome.get() = None };
+    }
+
+    /// Clear the outcome cell (loom-checked access).
+    ///
+    /// # Safety
+    /// No reader can observe the cell (a pooled slot has no observers; the
+    /// write is published by the subsequent Release store of `state`).
+    #[cfg(loom)]
+    unsafe fn clear_outcome(&self) {
+        self.outcome.with_mut(|ptr| {
+            // SAFETY: no concurrent readers (pooled-slot invariant).
+            unsafe { *ptr = None };
+        });
+    }
+
+    /// Return a pooled slot to the pristine pending state for reuse by a new
+    /// generation.
+    fn reset(&self) {
+        // SAFETY: pooled slots have no observers (see `Subject::drop`), so
+        // the cell is unobservable; the Release store publishes the clear.
+        unsafe { self.clear_outcome() };
+        self.state.store(0, Ordering::Release);
+    }
 }
 
 struct SlotEntry<O> {
     generation: usize,
     slot: Arc<Slot<O>>,
+}
+
+/// Upper bound on recycled slots retained per space.
+const SLOT_POOL_CAP: usize = 128;
+
+/// The key table plus the recycled-slot pool, guarded by one mutex so the
+/// pool needs no lock of its own (a single `&mut` through the guard).
+struct Entries<K, O> {
+    map: HashMap<K, SlotEntry<O>, BuildFx>,
+    // Recycled slots that no observer can still read, cap-bounded so
+    // retention stays explicitly bounded. A pooled slot's strong count is
+    // exactly the pool's own reference (see `Subject::drop`).
+    pool: Vec<Arc<Slot<O>>>,
 }
 
 struct Inner<K, O> {
@@ -187,7 +233,7 @@ struct Inner<K, O> {
     // is only compared under the `entries` mutex, whose acquire/release
     // orders the entry's publication. Relaxed is therefore sufficient.
     next_generation: AtomicUsize,
-    entries: Mutex<HashMap<K, SlotEntry<O>, BuildFx>>,
+    entries: Mutex<Entries<K, O>>,
 }
 
 /// Shared completion namespace.
@@ -216,7 +262,10 @@ impl<K, O> ObservationSpace<K, O> {
         Self {
             inner: Arc::new(Inner {
                 next_generation: AtomicUsize::new(1),
-                entries: Mutex::new(HashMap::with_hasher(BuildFx::default())),
+                entries: Mutex::new(Entries {
+                    map: HashMap::with_hasher(BuildFx::default()),
+                    pool: Vec::new(),
+                }),
             }),
         }
     }
@@ -243,16 +292,29 @@ where
     /// Panics if the process exhausts all generations.
     pub fn subject(&self, key: K) -> Result<Subject<K, O>, SubjectExists<K>> {
         let mut entries = lock(&self.inner.entries);
-        match entries.entry(key.clone()) {
-            Entry::Occupied(_) => Err(SubjectExists(key)),
+        let pooled = entries.pool.pop();
+        match entries.map.entry(key.clone()) {
+            Entry::Occupied(_) => {
+                // Restore the unused pooled slot.
+                if let Some(slot) = pooled {
+                    entries.pool.push(slot);
+                }
+                Err(SubjectExists(key))
+            }
             Entry::Vacant(vacant) => {
                 let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
                 assert_ne!(generation, usize::MAX, "observation generation exhausted");
-                let slot = Arc::new(Slot {
-                    state: AtomicUsize::new(0),
-                    outcome: UnsafeCell::new(None),
-                    waiters: Mutex::new(Vec::new()),
-                });
+                let slot = match pooled {
+                    Some(slot) => {
+                        slot.reset();
+                        slot
+                    }
+                    None => Arc::new(Slot {
+                        state: AtomicUsize::new(0),
+                        outcome: UnsafeCell::new(None),
+                        waiters: Mutex::new(Vec::new()),
+                    }),
+                };
                 vacant.insert(SlotEntry {
                     generation,
                     slot: slot.clone(),
@@ -275,6 +337,7 @@ where
     pub fn observe(&self, key: &K) -> Result<Observation<O>, UnknownSubject<K>> {
         let entries = lock(&self.inner.entries);
         let slot = entries
+            .map
             .get(key)
             .map(|entry| entry.slot.clone())
             .ok_or_else(|| UnknownSubject(key.clone()))?;
@@ -328,10 +391,19 @@ where
     fn drop(&mut self) {
         let mut entries = lock(&self.inner.entries);
         if entries
+            .map
             .get(&self.key)
             .is_some_and(|entry| entry.generation == self.generation)
         {
-            entries.remove(&self.key);
+            entries.map.remove(&self.key);
+            // With the entry gone and the entries lock held, no new observer
+            // can reference this slot (`observe` needs both), so the strong
+            // count can only decrease from here: it is exactly 1 (our own
+            // handle) exactly when no observer still holds it, making the
+            // slot safe to recycle.
+            if Arc::strong_count(&self.slot) == 1 && entries.pool.len() < SLOT_POOL_CAP {
+                entries.pool.push(self.slot.clone());
+            }
         }
     }
 }

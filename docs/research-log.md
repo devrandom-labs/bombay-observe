@@ -95,4 +95,79 @@ Protocol:
   including the wait path. Miri runs the real-thread unit tests.
 - Expected: `try_get` lock-free and `complete` lock-free when no waiter has
   ever registered; slot grows by the separate waiters mutex (retained +~8B).
+- Result: kept. See the final table below.
+
+## Experiment results (frozen workload, best-of-5, observations_per_second)
+
+| # | change | primary | vs baseline | decision |
+|---|--------|---------|-------------|----------|
+| 1 | baseline `Mutex<HashMap>` + Condvar slot | 7,815,698 | — | baseline |
+| 2 | EXP1: atomic generation (AtomicUsize fetch_add) + single `Entry` lookup | 11,492,376 | +47% | keep |
+| 3 | EXP2: eventcount slot (Condvar -> park/unpark + waiters Vec) | 14,014,443 | +79% | keep |
+| 4 | EXP3a: internal map hasher SipHash -> fixed-seed FxHash | 13,769,008 | +76% | keep (noise-neutral; map-heavy scenarios +16..+34%) |
+| 5 | EXP4: std::sync::Mutex -> parking_lot (std Mutex lazily mallocs its pthread mutex, 64B, on first lock - backtraced) | 25,889,716 | +231% | keep |
+| 6 | EXP5: 64-shard key table (FxHash shard selection) | 18,840,611 | +141% | REJECTED (-27%: shard hash + indirection cost more than contention gained) |
+| 7 | EXP6: lock-free outcome slot (unsafe: state word + UnsafeCell, waiters mutex) | 27,897,181 | +257% | keep |
+| 8 | EXP7: retire via remove-then-restore (single lookup) | 26,160,291 | +235% | REJECTED (-6%: hashbrown value-returning remove slower than get+conditional remove) |
+| 9 | harness: wait_roundtrip p50/p99 scenario | 27,932,473 | +257% | keep (no lib change) |
+
+Final design: 64-bit-shard-free single `Mutex<HashMap<K, SlotEntry, FxHasher>>`
+key table (parking_lot) + generation counter `AtomicUsize` + lock-free slot
+(single-word state: COMPLETED | HAS_WAITER; `UnsafeCell<Option<O>>`; waiters
+under their own `parking_lot::Mutex<Vec<Thread>>`).
+
+Final numbers (run #9): primary 27.93M; seq_observe_first 33.4M,
+seq_complete_first 33.0M, retire_recreate 38.2M, cancel 38.8M;
+fanout(8) 135.7M observations/s; hot path p50/p99 41/42 ns; wait round-trip
+p50/p99 2.7/6.2 us; contention 1t/4t/8t 38.8M/15.0M/8.5M; alloc 72 B / 1
+block per op; retained 112 B / 1 block per subject+observer; after-drop
+residue 1088 B (no leak).
+
+## Actorpass integration contract
+
+- Map one actor generation to a `Subject` at a key; publish the outcome via
+  `Subject::complete` exactly once on task completion; translate
+  observations into pure `ChildStopped`/`PeerStopped` events.
+- `Observation::try_get` is lock-free (single Acquire load + clone): safe on
+  any thread. `Observation::wait` parks the calling thread and wakes on
+  completion (p50 2.7 us on macOS); for async use, the slot's
+  HAS_WAITER/waiter-registry protocol extends to a waker slot: register a
+  `std::task::Waker` instead of a `Thread`, wake it from the drain. No Tokio,
+  no actor vocabulary, no runtime type erasure: the API is generic over
+  `K`/`O`; `O` needs `Clone` for `try_get`/`wait` and `Send + Sync` for the
+  observation to be shareable across threads (outcome becomes immutable at
+  publication).
+- Cancellation: dropping an `Observation` never touches the slot; it cannot
+  obstruct completion.
+- Retention: bounded by explicit ownership (Subject retains the key entry;
+  observers retain the slot Arc); all memory is freed when the last handle
+  drops (after-drop residue ~1 KB = stdout buffer + runtime).
+
+## Rejected designs (with evidence)
+
+- RCU / epoch reclamation / hazard pointers for the slot: not needed - `Arc`
+  already provides safe reclamation with bounded cost; observers hold the
+  slot past retirement. Would only matter if removing the one 72 B Arc
+  allocation per subject became the dominant cost (it is ~1/3 of the op now).
+- Sharded key table (EXP5): measured -27% (see table).
+- remove-then-restore retire (EXP7): measured -6% (see table).
+- RwLock entries map: not tried; writes are 2/3 of map ops, so reader
+  parallelism is capped; uncontended parking_lot RwLock reads cost about the
+  same as its Mutex. Low expected value.
+- dhat for allocation accounting: 0.3 dropped the programmatic stats API;
+  hand-rolled counting GlobalAlloc used instead (documented invariants).
+
+## Remaining risks
+
+- The unsafe slot's correctness rests on the documented invariants; loom
+  models the real implementation (7 tests, preemptions 3 and 7) and Miri
+  passes the real-thread tests. Any future change to the state protocol must
+  re-run both.
+- `wait()` on a subject that is never completed blocks forever (same as the
+  baseline Condvar design); no timeout API exists.
+- park/unpark wait is per-thread token-based; a thread waiting on two
+  observations concurrently can consume a cross-wake token as a spurious
+  wakeup (harmless - the wait loop re-checks).
+- The primary metric is sensitive to CPU frequency state (measured
+  +/-3.5% run-to-run); best-of-5 and in-script ordering mitigate it.
 

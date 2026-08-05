@@ -109,6 +109,25 @@ fn late_observer_reads_retained_outcome() {
     });
 }
 
+/// A recycled slot is fully reset: the stale COMPLETED bit of the previous
+/// generation must not leak into the replacement.
+#[test]
+fn pooled_slot_reuse_isolates_generations() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        {
+            let mut subject = space.subject(7_u64).unwrap();
+            subject.complete(1_u64);
+        }
+        // No observers ever existed, so the slot was pooled and is reused.
+        let mut subject = space.subject(7_u64).unwrap();
+        let observation = space.observe(&7_u64).unwrap();
+        assert_eq!(observation.try_get(), None);
+        subject.complete(2_u64);
+        assert_eq!(observation.try_get(), Some(2_u64));
+    });
+}
+
 /// Two concurrent waiters: the drain wakes both, each with the outcome.
 #[test]
 fn multiple_waiters_all_wake() {
