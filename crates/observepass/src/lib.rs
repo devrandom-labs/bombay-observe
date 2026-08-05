@@ -284,8 +284,10 @@ impl<K: Eq + Hash, O> SmallMap<K, O> {
         match self {
             Self::Inline(entries) => {
                 if entries.len() >= INLINE_CAP {
+                    // At most INLINE_CAP entries are promoted, so the hash
+                    // table never needs more than INLINE_CAP * 2 capacity.
                     let mut map =
-                        HashMap::with_capacity_and_hasher(entries.len() * 2, BuildFx::default());
+                        HashMap::with_capacity_and_hasher(INLINE_CAP * 2, BuildFx::default());
                     map.extend(entries.drain(..));
                     map.insert(key, entry);
                     *self = Self::Hash(map);

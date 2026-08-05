@@ -157,6 +157,24 @@ contract without changing the hot path:
 Primary unchanged (49.6M). std 9/9, loom 10/10 (into_outcome racing
 complete never torn), Miri 9/9, gate green.
 
+## Quantified rejection: hazard-pointer lock-free observe
+
+The last remaining perf lever (removing the observe entries lock) was
+analyzed at the cost level: a hazard-pointer read protocol (atomic load of
+the slot pointer, hazard publish, re-validate, `increment_strong_count`,
+unpublish) costs ~5-7 ns per read, versus ~5 ns for the lock it replaces
+(lock + inline scan). For the single-observer actorpass pattern the hazard
+protocol is not a win, and it would add a second unsafe component with
+reclamation proof obligations. Rejected on cost, not just complexity.
+
+## Compliance fix (perf-neutral): thiserror error types
+
+`SubjectExists`/`UnknownSubject` now derive `thiserror::Error` with Display
+messages (global devrandom rule: all error types use thiserror). Added the
+workspace dep; no behavior change (off the hot path). std 11/11, loom
+11/11, Miri 11/11, gate green. Primary 53.6M (new session best; run
+variance landed favorably).
+
 ## EXPERIMENT 12 - wait_timeout (API addition, perf-neutral, kept)
 
 `Observation::wait_timeout(Duration) -> Option<O>`: bounded blocking for
