@@ -157,6 +157,18 @@ contract without changing the hot path:
 Primary unchanged (49.6M). std 9/9, loom 10/10 (into_outcome racing
 complete never torn), Miri 9/9, gate green.
 
+## EXPERIMENT 12 - wait_timeout (API addition, perf-neutral, kept)
+
+`Observation::wait_timeout(Duration) -> Option<O>`: bounded blocking for
+adapters that must not block forever on a never-completed generation (e.g.,
+a crashed child). Same HAS_WAITER registration protocol as `wait`;
+`park_timeout` under the deadline, with the state re-check before the
+deadline test so a racing completion is still observed; a timed-out waiter
+stays registered (a later completion only produces a spurious wake). The
+loom build parks without a clock (`park_timeout` is not modeled; the
+registration protocol is covered). std 11/11, loom 11/11, Miri 11/11, gate
+green. Primary 50.5M (perf-neutral).
+
 ## Adapter example (deliverable, perf-neutral)
 
 `crates/observepass/examples/actorpass_adapter.rs` is executable proof of the
@@ -195,6 +207,7 @@ entries lock stays on the observe path.
 | 11 | EXP9: pool folded into Entries{map,pool} behind one mutex | 28,720,880 | +267% | keep |
 | 12 | EXP10: SmallMap hybrid (inline Vec <=4, promotes to HashMap) | 49,685,943 | +536% | keep |
 | 13 | EXP11: into_outcome (move-only) + register_waker (async hook) | 49,630,870 | +535% | keep (perf-neutral contract completion) |
+| 14 | EXP12: wait_timeout(Duration) -> Option<O> (bounded blocking) | 50,468,410 | +546% | keep (perf-neutral API addition) |
 
 Final design: single `Mutex<Entries { map: SmallMap<K, SlotEntry>, pool:
 Vec<Arc<Slot>> }>` key table (parking_lot; SmallMap = inline Vec <= 4

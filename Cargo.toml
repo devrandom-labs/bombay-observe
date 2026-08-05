@@ -10,6 +10,7 @@ observepass = { path = "crates/observepass" }
 criterion = "0.8"
 loom = "0.7"
 parking_lot = "0.12"
+thiserror = "2"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

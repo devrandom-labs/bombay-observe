@@ -381,11 +381,13 @@ impl<K, O> ObservationSpace<K, O> {
 }
 
 /// A live subject already exists at this key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a subject already exists for key {0:?}")]
 pub struct SubjectExists<K>(pub K);
 
 /// No retained subject exists at this key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("no subject retained for key {0:?}")]
 pub struct UnknownSubject<K>(pub K);
 
 impl<K, O> ObservationSpace<K, O>
