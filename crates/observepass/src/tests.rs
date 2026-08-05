@@ -198,3 +198,101 @@ fn wait_timeout_returns_outcome_when_completed() {
     );
     completer.join().unwrap();
 }
+
+/// Registering the same task's waker twice keeps a single entry (repeated
+/// polling never accumulates duplicates).
+///
+/// Uses a waker with a single static vtable: the std `Wake`-derived vtable
+/// is a const-promoted temporary whose address differs between code sites
+/// under Miri, which would make `will_wake` spuriously false.
+#[test]
+fn register_waker_is_idempotent_per_task() {
+    use crate::{Waiter, lock};
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    struct RawFlagWaker(AtomicBool);
+
+    unsafe fn raw_clone(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &RAW_VTABLE)
+    }
+
+    unsafe fn raw_wake(data: *const ()) {
+        // SAFETY: the data is always the RawFlagWaker created by this test,
+        // which outlives every wake call.
+        let flag = unsafe { &*(data.cast::<RawFlagWaker>()) };
+        flag.0.store(true, Ordering::Relaxed);
+    }
+
+    unsafe fn raw_wake_by_ref(data: *const ()) {
+        // SAFETY: same contract as `raw_wake`.
+        unsafe { raw_wake(data) };
+    }
+
+    unsafe fn raw_drop(_data: *const ()) {}
+
+    static RAW_VTABLE: RawWakerVTable =
+        RawWakerVTable::new(raw_clone, raw_wake, raw_wake_by_ref, raw_drop);
+
+    let flag = Arc::new(RawFlagWaker(AtomicBool::new(false)));
+    // SAFETY: the pointer is valid for the test's lifetime (the Arc is held
+    // here); clone/drop do not dereference it.
+    let waker = unsafe {
+        Waker::from_raw(RawWaker::new(
+            std::ptr::from_ref(Arc::as_ref(&flag)).cast(),
+            &RAW_VTABLE,
+        ))
+    };
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    assert!(!observation.register_waker(&waker));
+    assert!(!observation.register_waker(&waker));
+    let waiters = lock(&observation.slot.waiters);
+    assert_eq!(waiters.len(), 1);
+    assert!(matches!(&waiters[0], Waiter::Waker(w) if w.will_wake(&waker)));
+    drop(waiters);
+    subject.complete(9_u64);
+    assert!(flag.0.load(Ordering::Relaxed));
+    assert_eq!(observation.try_get(), Some(9_u64));
+}
+
+/// The observation's `IntoFuture` resolves to the outcome on completion.
+#[test]
+fn observation_future_resolves_on_completion() {
+    use std::future::IntoFuture;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let mut future = space.observe(&7_u64).unwrap().into_future();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+    subject.complete(9_u64);
+    assert!(matches!(
+        Pin::new(&mut future).poll(&mut cx),
+        Poll::Ready(9_u64)
+    ));
+}
+
+/// Dropping the future deregisters its waker: completion after a cancelled
+/// future does not fire it, and the slot's outcome stays readable.
+#[test]
+fn dropping_observation_future_deregisters_waker() {
+    use std::future::IntoFuture;
+    use std::pin::Pin;
+    use std::task::Context;
+
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    let flag = Arc::new(FlagWake(AtomicBool::new(false)));
+    let waker = std::task::Waker::from(Arc::clone(&flag));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = observation.into_future();
+    assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+    drop(future);
+    subject.complete(9_u64);
+    assert!(!flag.0.load(Ordering::Relaxed));
+    assert_eq!(space.observe(&7_u64).unwrap().try_get(), Some(9_u64));
+}

@@ -6,9 +6,11 @@
 //! the adapter's own `ChildStopped`/`PeerStopped` vocabulary - observepass
 //! itself knows none of it.
 
+use std::future::IntoFuture;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 
 use observepass::ObservationSpace;
 
@@ -68,4 +70,22 @@ fn main() {
     let peer_observation = space.observe(&8).expect("subject retained");
     peer_generation.complete(Outcome::PeerStopped(8));
     assert_eq!(peer_observation.try_get(), Some(Outcome::PeerStopped(8)));
+
+    // The same flow with the future API: an observation is directly awaitable
+    // (its waker is registered and deregistered automatically; dropping the
+    // future cancels cleanly). Driven here by hand instead of an executor.
+    let mut peer_generation = space.subject(9).expect("fresh key");
+    let mut future = space.observe(&9).expect("subject retained").into_future();
+    let signal = Arc::new(Signal(AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&signal));
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+    peer_generation.complete(Outcome::PeerStopped(9));
+    while !signal.0.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        Pin::new(&mut future).poll(&mut cx),
+        Poll::Ready(Outcome::PeerStopped(9))
+    ));
 }

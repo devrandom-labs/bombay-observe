@@ -16,10 +16,10 @@ The complete design is green, stable, and independently reviewed:
   HAS_WAITER`, `UnsafeCell<Option<O>>` outcome, waiters under their own
   mutex as `Thread | Waker`) + recycled-slot pool (retire-time
   `strong_count == 1` proof, cap 128, stale-waiter drain at reset).
-- **Throughput**: ~50.5M observations/s stable (recorded best 54.5M;
-  run spread 46-55M is OS scheduling, see measurement caveat below),
-  +546% over the 7.8M baseline; zero allocations per op; 112 B retained per
-  subject+observer; hot path p50/p99 41/42 ns; wait round-trip p50 ~2-3 us.
+- **Throughput**: ~53.2M observations/s stable on AC (three runs
+  53.5/53.1/53.3M; recorded best 54.5M), +581% over the 7.8M baseline; zero
+  allocations per op; 112 B retained per subject+observer; hot path p50/p99
+  41/42 ns; wait round-trip p50 ~3 us.
 - **API**: `try_get` (lock-free), `wait`, `wait_timeout`, `register_waker`
   (std `Waker`, async adapter hook), `into_outcome` (move-only), thiserror
   errors; runnable adapter example in `examples/actorpass_adapter.rs`.
@@ -209,6 +209,46 @@ All fixes perf-neutral (3 direct runs 50.41-50.52M, identical to the
 pre-fix stable value). std 12/12, loom 11/11 at preemptions 3 and 7, Miri
 12/12, gate green.
 
+## Waker-registration review pass (all feedback points addressed)
+
+External review feedback on the async registration path, addressed with
+primary-source research:
+
+1. **`register_waker` accumulated duplicate/abandoned wakers** (each call
+   pushed a fresh clone; dropping the Observation did not deregister). Fixed
+   with the std-endorsed pattern: a registration whose `Waker::will_wake` an
+   already-registered waker is idempotent (no clone, no allocation on the
+   repeated path). `will_wake` is two pointer comparisons (`std` wake.rs);
+   `Waker::clone_from` exists precisely for this dedup.
+2. **No cancellation hook for async observers.** Added `IntoFuture for
+   Observation` producing `ObservationFuture`, whose poll registers the
+   task's waker idempotently and whose `Drop` deregisters it (the canonical
+   cancellation mechanism: dropping a future cancels it; see sunshowers,
+   "Cancelling async Rust"). An observation is now directly awaitable.
+   Replaces the tokio `AtomicWaker` "overwrite existing waker" pattern
+   (tokio src/sync/task/atomic_waker.rs) for the multi-observer fanout case.
+3. **Stale doc**: `wait_timeout` still claimed timed-out waiters stay
+   registered; the implementation (review-fix pass) deregisters them.
+   Corrected.
+4. **Loom build warning**: unused `deadline` under `--cfg loom`. The deadline
+   computation and the `Instant` import are now cfg-gated; the loom build is
+   warning-free.
+
+Notable discovery while testing: under Miri, `Waker::will_wake` between an
+original and its clone is spuriously false for `Waker::from(Arc)`-derived
+wakers - std's `Wake` vtable is a const-promoted temporary
+(`&RawWakerVTable::new(...)`) created at each call site; native builds merge
+the identical constants (same address), Miri keeps them distinct. The
+dedup falls back safely (a duplicate entry) when `will_wake` is
+conservatively false. Tests use a single-static-vtable raw waker so the
+dedup is exact under both native and Miri (the test's own unsafe is
+Miri-checked by the run).
+
+Verification: std 15/15 (3 new tests: idempotent registration, future
+resolves, future-drop deregisters), loom 11/11 at preemptions 3 and 7,
+Miri 15/15, clippy clean, gate green, example extended with the future
+flow.
+
 ## Quantified rejection: hazard-pointer lock-free observe
 
 The last remaining perf lever (removing the observe entries lock) was
@@ -282,6 +322,7 @@ entries lock stays on the observe path.
 | 16 | EXP13: thiserror error types (compliance, perf-neutral) | 53,624,694 | +586% | keep |
 | 17 | const-capacity promotion (compliance, perf-neutral) | 54,523,894 | +598% | keep |
 | 18 | review fixes (stale-waiter deregistration + reset drain, perf-neutral) | 50,470,853 | +546% | keep |
+| 19 | AC re-measurement (machine returned to AC; definitive record) | 52,450,302 | +571% | keep |
 
 Final design: single `Mutex<Entries { map: SmallMap<K, SlotEntry>, pool:
 Vec<Arc<Slot>> }>` key table (parking_lot; SmallMap = inline Vec <= 4
@@ -292,13 +333,15 @@ lock-free slot (single-word state: COMPLETED | HAS_WAITER;
 proof, cap 128, stale-waiter drain at reset). API also provides
 `wait_timeout`, `register_waker`, and `into_outcome`; errors via thiserror.
 
-Final numbers (run #19, post-review-fix): primary ~50.5M stable (recorded
-best 54.5M at run #18); seq_observe_first 41.9-51.4M (noisy),
-seq_complete_first 47.8M, retire_recreate 71.5M, cancel 51.6M;
-fanout(8) 151.1M observations/s; hot path p50/p99 41/42 ns; wait round-trip
-p50/p99 ~2-3/6-8 us; contention 1t/4t/8t ~52M/~21M/~10M; alloc 0 B / 0
-blocks per op (pooled); retained 112 B / 1 block per subject+observer;
-after-drop residue 1088 B (no leak).
+Final numbers (run #26, definitive AC record): primary 52.5M recorded,
+three direct runs 53.5/53.1/53.3M (stable ~53.2M, best 54.5M at run #18);
+seq_complete_first 46.2M, retire_recreate 70.2M, cancel 53.8M;
+fanout(8) 153.2M observations/s; hot path p50/p99 41/42 ns; wait round-trip
+p50/p99 3.0/6.7 us; contention 1t/2t/4t/8t/16t 52.8M/31.8M/22.2M/10.7M/
+12.2M; alloc 0 B / 0 blocks per op (pooled); retained 112 B / 1 block per
+subject+observer; after-drop residue 1088 B (no leak). The frozen criterion
+bench measures complete_then_observe at 18.8 ns/iteration on AC (27.0 ns on
+battery - a 1.44x ratio confirming the power-governor depression).
 
 ## Actorpass integration contract
 
@@ -352,8 +395,9 @@ after-drop residue 1088 B (no leak).
 - The primary metric is sensitive to OS scheduling (E-core vs P-core for
   the short frozen process) and to the power source: on battery, macOS caps
   the boost clocks and every scenario measures uniformly ~30% lower
-  (~35.5M for the primary; confirmed `pmset -g batt` = discharging).
-  The session's recorded numbers were measured on AC power. Relative
-  comparisons within the same power state remain valid; re-measure absolute
-  numbers on AC.
+  (~35.5M for the primary; confirmed `pmset -g batt` = discharging). The
+  battery window (runs #21-25, all flagged) was a pure power-governor
+  artifact - the code never changed. The definitive AC re-measurement
+  (run #26) confirms full recovery: stable ~53.2M (three runs 53.5/53.1/53.3M),
+  best 54.5M. Relative comparisons within a power state are valid.
 

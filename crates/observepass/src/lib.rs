@@ -4,12 +4,17 @@ use core::hash::{BuildHasherDefault, Hash, Hasher};
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
+use std::future::{Future, IntoFuture};
 use std::mem;
+use std::pin::Pin;
 #[cfg(loom)]
 use std::sync::PoisonError;
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Waker;
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+#[cfg(not(loom))]
+use std::time::Instant;
 
 /// Fixed-seed 64-bit multiply-xor-rotate hasher (rustc's `FxHash`, as in the
 /// `rustc-hash` crate). Deterministic across runs and fast for small keys;
@@ -75,7 +80,6 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 #[cfg(not(loom))]
 use std::thread::{Thread, current, park, park_timeout};
-use std::time::{Duration, Instant};
 
 /// Acquire a mutex, unwrapping poisoning. std's `Mutex` poisons (and, on
 /// macOS, lazily heap-allocates its pthread mutex on first lock);
@@ -600,8 +604,8 @@ impl<O: Clone> Observation<O> {
     /// Returns `None` when the timeout elapses before the outcome is
     /// published. A completion that races the deadline is still observed:
     /// the loop re-checks after every wake, before the deadline test. A
-    /// timed-out waiter remains registered; a later completion only produces
-    /// a spurious wake.
+    /// timed-out waiter is deregistered before returning, so a later
+    /// completion cannot wake it.
     ///
     /// # Panics
     /// Panics if the completed-bit protocol is violated (a programmer bug; a
@@ -609,9 +613,12 @@ impl<O: Clone> Observation<O> {
     /// overflows the [`Instant`] deadline.
     #[must_use]
     pub fn wait_timeout(&self, timeout: Duration) -> Option<O> {
+        #[cfg(not(loom))]
         let deadline = Instant::now()
             .checked_add(timeout)
             .expect("wait timeout overflows Instant");
+        #[cfg(loom)]
+        let _ = timeout;
         loop {
             if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
                 // SAFETY: COMPLETED observed with Acquire (invariant 2), so
@@ -701,8 +708,73 @@ impl<O> Observation<O> {
             // spurious wake, which callers must tolerate.
             return true;
         }
+        // Registering a waker that will_wake an already-registered one is
+        // idempotent (the std-endorsed pattern behind `Waker::clone_from`):
+        // repeated polling of the same task never accumulates duplicates,
+        // and the re-registration path performs no clone and no allocation.
+        if waiters
+            .iter()
+            .any(|waiter| matches!(waiter, Waiter::Waker(existing) if existing.will_wake(waker)))
+        {
+            return false;
+        }
         waiters.push(Waiter::Waker(waker.clone()));
         false
+    }
+}
+
+/// A future that resolves to the outcome when the subject completes.
+///
+/// Created via [`Observation`]'s [`IntoFuture`] impl (the `.await` sugar in
+/// an async adapter). Polling registers the task's waker idempotently
+/// (repeated polls never accumulate duplicate registrations); dropping the
+/// future before completion deregisters its waker, so cancelled
+/// observations leave no stale registration that would keep the waker's
+/// payload alive or fire across generations.
+pub struct ObservationFuture<O> {
+    observation: Observation<O>,
+    waker: Option<Waker>,
+}
+
+impl<O: Clone> Future for ObservationFuture<O> {
+    type Output = O;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+        let this = self.get_mut();
+        if let Some(outcome) = this.observation.try_get() {
+            return Poll::Ready(outcome);
+        }
+        // Idempotently register the task's waker; `register_waker` re-checks
+        // completion, so a completion racing the registration is caught.
+        let _ = this.observation.register_waker(cx.waker());
+        if let Some(outcome) = this.observation.try_get() {
+            return Poll::Ready(outcome);
+        }
+        this.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl<O> Drop for ObservationFuture<O> {
+    fn drop(&mut self) {
+        // Deregister the waker this future registered: cancelling the future
+        // must not leave a stale registration behind.
+        if let Some(waker) = &self.waker {
+            let mut waiters = lock(&self.observation.slot.waiters);
+            waiters.retain(|waiter| !matches!(waiter, Waiter::Waker(w) if w.will_wake(waker)));
+        }
+    }
+}
+
+impl<O: Clone> IntoFuture for Observation<O> {
+    type Output = O;
+    type IntoFuture = ObservationFuture<O>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        ObservationFuture {
+            observation: self,
+            waker: None,
+        }
     }
 }
 
