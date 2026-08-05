@@ -2,16 +2,17 @@
 
 use core::hash::{BuildHasherDefault, Hash, Hasher};
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::atomic::AtomicUsize;
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::mem::{self, MaybeUninit};
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::ptr;
 #[cfg(loom)]
 use std::sync::PoisonError;
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 #[cfg(not(loom))]
@@ -74,6 +75,8 @@ use loom::sync::Mutex;
 #[cfg(loom)]
 use loom::sync::RwLock;
 #[cfg(loom)]
+use loom::sync::atomic::AtomicPtr;
+#[cfg(loom)]
 use loom::thread::{Thread, current, park};
 #[cfg(not(loom))]
 use parking_lot::Mutex;
@@ -83,6 +86,8 @@ use parking_lot::RwLock;
 use std::cell::UnsafeCell;
 #[cfg(not(loom))]
 use std::sync::Arc;
+#[cfg(not(loom))]
+use std::sync::atomic::AtomicPtr;
 #[cfg(not(loom))]
 use std::thread::{Thread, current, park, park_timeout};
 
@@ -187,10 +192,13 @@ struct Slot<O> {
     // O-sized (no Option tag): the OUTCOME_VALID bit in `state` is the
     // liveness marker, and COMPLETED gates every read.
     outcome: UnsafeCell<MaybeUninit<O>>,
-    // Created lazily on the first waiter: the common case (no waiters ever)
-    // keeps the slot 16 bytes smaller and allocation-free, and the hot path
-    // never touches this field.
-    waiters: OnceLock<Arc<Mutex<Vec<Waiter>>>>,
+    // Raw pointer to a lazily created `Mutex<Vec<Waiter>>` (null until the
+    // first waiter). The slot owns the allocation and reclaims it at its
+    // final drop, so the common case (no waiters ever) keeps the slot 8
+    // bytes smaller and allocation-free; the hot path never touches this
+    // field. The Arc indirection is unnecessary: the mutex is owned by the
+    // slot itself, which outlives every waiter.
+    waiters: AtomicPtr<Mutex<Vec<Waiter>>>,
 }
 
 // SAFETY: the outcome cell is written exactly once, before the COMPLETED bit
@@ -274,9 +282,40 @@ impl<O> Slot<O> {
     }
 
     /// The waiters registry, created on first use.
+    ///
+    /// The registry is a `Box<Mutex<Vec<Waiter>>>` published by a CAS from
+    /// null on the first access and reclaimed by the slot's final drop.
+    /// Losing the init race reclaims the loser's box; the winner's pointer
+    /// is live as long as the slot is.
     fn waiters(&self) -> &Mutex<Vec<Waiter>> {
-        self.waiters
-            .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+        let ptr = self.waiters.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            // SAFETY: a non-null pointer was published by the init CAS and
+            // is reclaimed only by this slot's final drop, which cannot run
+            // while we hold a borrow of the slot.
+            return unsafe { &*ptr };
+        }
+        // SAFETY: `new` is a fresh, uniquely owned allocation.
+        let new = Box::into_raw(Box::new(Mutex::new(Vec::new())));
+        match self.waiters.compare_exchange(
+            ptr::null_mut(),
+            new,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // SAFETY: we won the init race; `new` is published.
+                unsafe { &*new }
+            }
+            Err(actual) => {
+                // Lost the init race: reclaim our box and use the winner's.
+                // SAFETY: `new` was never published; we own it exclusively.
+                drop(unsafe { Box::from_raw(new) });
+                // SAFETY: `actual` was published by the winner and is live
+                // as long as the slot is.
+                unsafe { &*actual }
+            }
+        }
     }
 
     /// Return a pooled slot to the pristine pending state for reuse by a new
@@ -296,8 +335,12 @@ impl<O> Slot<O> {
             // is retained in the pool or fired across generations. No waiter
             // can be in flight: a live waiter holds an observation Arc, and
             // pooled slots have none.
-            if let Some(waiters) = self.waiters.get() {
-                lock(waiters).clear();
+            let ptr = self.waiters.load(Ordering::Acquire);
+            if !ptr.is_null() {
+                // SAFETY: HAS_WAITER implies a waiter registered, which
+                // initialized the registry; the pointer is live as long as
+                // the slot is.
+                unsafe { lock(&*ptr).clear() };
             }
         }
         self.state.store(0, Ordering::Release);
@@ -314,6 +357,13 @@ impl<O> Drop for Slot<O> {
         if self.state.load(Ordering::Relaxed) & OUTCOME_VALID != 0 {
             // SAFETY: see above.
             unsafe { self.drop_outcome() };
+        }
+        // Reclaim the lazily created waiters registry, if any.
+        let ptr = self.waiters.load(Ordering::Relaxed);
+        if !ptr.is_null() {
+            // SAFETY: the last reference is being dropped; the box is owned
+            // by this slot and no other thread can access it.
+            drop(unsafe { Box::from_raw(ptr) });
         }
     }
 }
@@ -504,7 +554,7 @@ where
             None => Arc::new(Slot {
                 state: AtomicUsize::new(0),
                 outcome: UnsafeCell::new(MaybeUninit::uninit()),
-                waiters: OnceLock::new(),
+                waiters: AtomicPtr::new(ptr::null_mut()),
             }),
         };
         entries.map.insert_vacant(
