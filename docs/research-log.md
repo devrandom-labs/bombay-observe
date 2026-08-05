@@ -350,7 +350,10 @@ after-drop residue 1088 B (no leak).
   wakeup (harmless - the wait loop re-checks). Registrations are deduped
   and deregistered on early return/timeout, so the waiters Vec stays small.
 - The primary metric is sensitive to OS scheduling (E-core vs P-core for
-  the short frozen process); measured run-to-run spread ~46-55M (+/-10%),
-  mitigated by best-of-5 and in-script ordering. Relative comparisons
-  across experiments remain valid.
+  the short frozen process) and to the power source: on battery, macOS caps
+  the boost clocks and every scenario measures uniformly ~30% lower
+  (~35.5M for the primary; confirmed `pmset -g batt` = discharging).
+  The session's recorded numbers were measured on AC power. Relative
+  comparisons within the same power state remain valid; re-measure absolute
+  numbers on AC.
 
