@@ -593,3 +593,26 @@ battery - a 1.44x ratio confirming the power-governor depression).
   (run #26) confirms full recovery: stable ~53.2M (three runs 53.5/53.1/53.3M),
   best 54.5M. Relative comparisons within a power state are valid.
 
+
+## Observation: complete-first shape is ~9% slower than observe-first (battery regime)
+
+The frozen full-matrix harness (33d607a) measures both orderings of the same
+per-op sequence (subject + observe + complete + try_get + retire; identical
+lock counts: 2 write-locks + 1 read-lock). Across three runs (segment 2
+baseline + confirmation), `seq_complete_first_ops_per_second` is
+consistently ~9% below `seq_observe_first_ops_per_second` with
+non-overlapping medians (39.0M vs 42.9M, ranges 38.93-39.22M vs
+42.66-43.03M) - reproducible, not variance. The only difference is the
+position of the lock-free `complete` relative to the read-locked `observe`
+(complete before the read vs after it).
+
+No mechanism found analytically: the state-word RMWs and the Arc-count RMWs
+touch the same 32B cache line in the same order either way, and the read
+lock's acquisition policy does not differ between the shapes. The likely
+contributor is the parking_lot RwLock's writer-favoring transition behavior
+(a read acquired immediately after a fresh writer release vs one acquired
+before the next writer), which is a property of the crate, not of the
+mechanism - the shapes' code is fixed, so this is documented as a
+measurement observation, not an actionable regression. If a future RwLock
+replacement or read-path change is ever measured, the complete-first shape
+is the more sensitive of the two orderings.
