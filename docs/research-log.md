@@ -230,6 +230,34 @@ heap keys is the `key.clone()` into the map entry (inherent: both the entry
 and the Subject own the key; free for the `u64` keys of the frozen
 workload).
 
+## EXPERIMENT 17 - triomphe Arc, drop the weak count (kept, measured)
+
+Hypothesis (memory axis + layout): the std `Arc` header is 16B (strong +
+weak counts), but observepass never uses `Weak` - every operation is
+strong-only (`strong_count` for the retire-time pool proof, `try_unwrap` for
+`into_outcome`'s last-reference take, `clone`/`drop`). The weak count is pure
+overhead. `triomphe` (servo's Arc, zero dependencies, 8B header: strong
+count only) is API-compatible for every operation used. Slot ArcInner 40->32B;
+retained 80->72B (-10%); alloc stays 0/op.
+
+Unexpected second win (layout, not bytes): the data now sits at offset 8
+instead of 16, so the state word, the outcome cell, and the refcount pack
+into one 32B cache line instead of straddling two. Measured: primary 56.0M
+(new best; previous best 54.5M, spread was 51-54M), contention
+1t/2t/4t/8t/16t 58.8M/34.4M/12.8M/14.3M (8t was 10.5-11.4M), retire_recreate
+81.4M (from ~72M), seq_observe_first 60.2M. The cache-line consolidation
+helped every scenario that touches the slot's shared allocation.
+
+Wrinkle: the triomphe `Arc`'s `PhantomData<Slot<O>>` propagates `O`'s `Unpin`
+(the std `Arc` impls `Unpin` unconditionally), so `ObservationFuture::poll`
+uses the standard manual pin-projection (`get_unchecked_mut`) with a
+documented SAFETY argument: the future's fields are never moved out of the
+pinned location (the observation is only borrowed; the waker slot is
+replaced in place). No API constraint added.
+
+Verification: std 15/15, loom 11/11 at preemptions 3 and 7 (cfg(loom)
+unchanged - loom's own Arc), Miri 15/15, clippy clean, gate CHECK OK.
+
 ## EXPERIMENT 16 - waiters AtomicPtr, drop the Arc indirection (kept, measured)
 
 Hypothesis (memory-efficiency axis): EXP14's `OnceLock<Arc<Mutex<Vec<Waiter>>>>`
