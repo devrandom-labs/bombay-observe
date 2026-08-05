@@ -345,6 +345,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "observepass-harness"
+version = "0.1.0"
+dependencies = [
+ "observepass",
+]
+
+[[package]]
 name = "observepass-perf"
 version = "0.1.0"
 dependencies = [
