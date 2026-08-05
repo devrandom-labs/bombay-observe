@@ -4,6 +4,7 @@ use core::hash::{BuildHasherDefault, Hash, Hasher};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::mem;
+#[cfg(loom)]
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -56,14 +57,33 @@ impl Hasher for FxHasher {
 type BuildFx = BuildHasherDefault<FxHasher>;
 
 #[cfg(loom)]
-use loom::sync::{Arc, Mutex};
+use loom::sync::Arc;
+#[cfg(loom)]
+use loom::sync::Mutex;
 #[cfg(loom)]
 use loom::thread::{Thread, current, park};
 #[cfg(not(loom))]
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+#[cfg(not(loom))]
+use std::sync::Arc;
 #[cfg(not(loom))]
 use std::thread::{Thread, current, park};
 
+/// Acquire a mutex, unwrapping poisoning. std's `Mutex` poisons (and, on
+/// macOS, lazily heap-allocates its pthread mutex on first lock);
+/// `parking_lot`'s is inline and does not poison. The loom build models the
+/// same lock protocol with loom's scheduler.
+#[cfg(loom)]
+fn lock<T>(mutex: &loom::sync::Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(recover)
+}
+
+#[cfg(not(loom))]
+fn lock<T>(mutex: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
+    mutex.lock()
+}
+
+#[cfg(loom)]
 fn recover<T>(error: PoisonError<T>) -> T {
     error.into_inner()
 }
@@ -151,7 +171,7 @@ where
     /// # Panics
     /// Panics if the process exhausts all generations.
     pub fn subject(&self, key: K) -> Result<Subject<K, O>, SubjectExists<K>> {
-        let mut entries = self.inner.entries.lock().unwrap_or_else(recover);
+        let mut entries = lock(&self.inner.entries);
         match entries.entry(key.clone()) {
             Entry::Occupied(_) => Err(SubjectExists(key)),
             Entry::Vacant(vacant) => {
@@ -183,7 +203,7 @@ where
     /// # Errors
     /// Returns [`UnknownSubject`] when no generation is currently retained.
     pub fn observe(&self, key: &K) -> Result<Observation<O>, UnknownSubject<K>> {
-        let entries = self.inner.entries.lock().unwrap_or_else(recover);
+        let entries = lock(&self.inner.entries);
         let slot = entries
             .get(key)
             .map(|entry| entry.slot.clone())
@@ -214,7 +234,7 @@ where
     /// Panics when the same subject publishes completion more than once.
     pub fn complete(&mut self, outcome: O) {
         assert!(!self.completed, "subject completed twice");
-        let mut state = self.slot.state.lock().unwrap_or_else(recover);
+        let mut state = lock(&self.slot.state);
         state.outcome = Some(outcome);
         self.completed = true;
         let waiters = mem::take(&mut state.waiters);
@@ -230,7 +250,7 @@ where
     K: Eq + Hash,
 {
     fn drop(&mut self) {
-        let mut entries = self.inner.entries.lock().unwrap_or_else(recover);
+        let mut entries = lock(&self.inner.entries);
         if entries
             .get(&self.key)
             .is_some_and(|entry| entry.generation == self.generation)
@@ -249,12 +269,7 @@ impl<O: Clone> Observation<O> {
     /// Return the outcome without blocking when already complete.
     #[must_use]
     pub fn try_get(&self) -> Option<O> {
-        self.slot
-            .state
-            .lock()
-            .unwrap_or_else(recover)
-            .outcome
-            .clone()
+        lock(&self.slot.state).outcome.clone()
     }
 
     /// Block the current thread until completion.
@@ -266,8 +281,9 @@ impl<O: Clone> Observation<O> {
     /// park then returns immediately). Nothing that could itself park runs
     /// between registration and [`park`], so the token cannot be consumed
     /// elsewhere.
+    #[must_use]
     pub fn wait(&self) -> O {
-        let mut state = self.slot.state.lock().unwrap_or_else(recover);
+        let mut state = lock(&self.slot.state);
         loop {
             if let Some(outcome) = state.outcome.clone() {
                 return outcome;
@@ -275,7 +291,7 @@ impl<O: Clone> Observation<O> {
             state.waiters.push(current());
             drop(state);
             park();
-            state = self.slot.state.lock().unwrap_or_else(recover);
+            state = lock(&self.slot.state);
         }
     }
 }

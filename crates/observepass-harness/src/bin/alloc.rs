@@ -19,7 +19,6 @@ static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static CURRENT_BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// Live heap bytes; rises on `alloc`, falls on `dealloc`, adjusted on `realloc`.
 static CURRENT_BYTES: AtomicI64 = AtomicI64::new(0);
-
 /// Global allocator that delegates to [`System`] and counts.
 ///
 /// # Invariants
