@@ -85,11 +85,11 @@ use parking_lot::RwLock;
 #[cfg(not(loom))]
 use std::cell::UnsafeCell;
 #[cfg(not(loom))]
-use std::sync::Arc;
-#[cfg(not(loom))]
 use std::sync::atomic::AtomicPtr;
 #[cfg(not(loom))]
 use std::thread::{Thread, current, park, park_timeout};
+#[cfg(not(loom))]
+use triomphe::Arc;
 
 /// Acquire a mutex, unwrapping poisoning. std's `Mutex` poisons (and, on
 /// macOS, lazily heap-allocates its pthread mutex on first lock);
@@ -857,7 +857,13 @@ impl<O: Clone> Future for ObservationFuture<O> {
     type Output = O;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
-        let this = self.get_mut();
+        // SAFETY: `ObservationFuture` is not `Unpin` when `O` is not (the
+        // triomphe Arc's `PhantomData<Slot<O>>` propagates the bound), but
+        // its fields are never moved out of the pinned location: the
+        // observation is only borrowed, and the waker slot is replaced in
+        // place. This is the standard manual pin-projection for !Unpin
+        // futures; the future's `Drop` also runs fine on a pinned value.
+        let this = unsafe { self.get_unchecked_mut() };
         if let Some(outcome) = this.observation.try_get() {
             return Poll::Ready(outcome);
         }
