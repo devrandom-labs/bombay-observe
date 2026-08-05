@@ -230,6 +230,18 @@ heap keys is the `key.clone()` into the map entry (inherent: both the entry
 and the Subject own the key; free for the `u64` keys of the frozen
 workload).
 
+## EXPERIMENT 13 - entries RwLock (kept, measured)
+
+Hypothesis (correcting an earlier analytical dismissal): the observe read (1
+of 3 entries-lock acquisitions per op) parallelizes under an `RwLock`.
+Measured: primary neutral (52.9M vs 53.2M Mutex over 3 direct runs each),
+contention improves +10-20% (2t 26.6->32.1M, 4t 19.7->21.8M, 8t 9.6->10.5M,
+16t 11.8->12.2M, 1t 52.7->54.9M). The read-parallelization gain outweighs
+the marginally higher write-lock cost. Lesson: "writes dominate" was wrong
+at the handoff-latency level - the reads' parallel acquisitions matter.
+observe takes a read lock; subject/retire take write locks; the pool stays
+inside Entries under the write lock; loom uses `loom::sync::RwLock`.
+
 ## Waker-registration review pass (all feedback points addressed)
 
 External review feedback on the async registration path, addressed with
@@ -344,6 +356,7 @@ entries lock stays on the observe path.
 | 17 | const-capacity promotion (compliance, perf-neutral) | 54,523,894 | +598% | keep |
 | 18 | review fixes (stale-waiter deregistration + reset drain, perf-neutral) | 50,470,853 | +546% | keep |
 | 19 | AC re-measurement (machine returned to AC; definitive record) | 52,450,302 | +571% | keep |
+| 20 | EXP13: entries Mutex -> RwLock (observe reads parallelize) | 53,591,763 | +586% | keep (primary-neutral; contention +10-20%) |
 
 Final design: single `Mutex<Entries { map: SmallMap<K, SlotEntry>, pool:
 Vec<Arc<Slot>> }>` key table (parking_lot; SmallMap = inline Vec <= 4
