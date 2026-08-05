@@ -392,11 +392,13 @@ fn stale_retirement_cannot_remove_replacement() {
     let subject = space.subject(7_u64).unwrap();
     let old_generation = subject.generation;
 
-    // Manually install a newer generation at the same key, as if a
-    // replacement subject had been created between the owner's liveness
-    // check and its retirement.
+    // Manually retire the table entry WITHOUT dropping its owner, then install
+    // a newer generation at the same key. The retained `subject` is now a
+    // genuinely stale owner: unlike inserting a duplicate inline-map key,
+    // this forces its later Drop through the generation-mismatch branch.
     {
         let mut entries = write_lock(&space.inner.entries);
+        assert!(entries.map.remove_if(&7_u64, old_generation));
         let replacement = SlotArc::new(Slot {
             state: AtomicUsize::new(0),
             outcome: UnsafeCell::new(MaybeUninit::uninit()),
@@ -444,4 +446,68 @@ fn wait_timeout_zero_times_out_immediately() {
     }
     subject.complete(9_u64);
     assert_eq!(observation.try_get(), Some(9_u64));
+}
+
+#[derive(Clone)]
+struct DropProbe(Arc<AtomicUsize>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A completed outcome retained by an observation is destroyed exactly once
+/// when the last slot owner disappears.
+#[test]
+fn completed_outcome_is_dropped_exactly_once() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    subject.complete(DropProbe(drops.clone()));
+    drop(subject);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(observation);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(space);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// Reusing a pooled slot destroys its previous completed outcome once before
+/// making the storage visible to the replacement generation.
+#[test]
+fn pooled_slot_reset_drops_previous_outcome_exactly_once() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    subject.complete(DropProbe(drops.clone()));
+    drop(subject);
+    assert_eq!(drops.load(Ordering::SeqCst), 0, "pool retains the outcome");
+
+    let replacement = space.subject(8_u64).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1, "reset drops old outcome");
+    drop(replacement);
+    drop(space);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// Moving an outcome out clears the slot's validity bit: only the moved value,
+/// never the slot's destructor, owns the eventual drop.
+#[test]
+fn into_outcome_transfers_drop_ownership_exactly_once() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    subject.complete(DropProbe(drops.clone()));
+    drop(subject);
+    let outcome = observation
+        .into_outcome()
+        .expect("last observer moves outcome");
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(outcome);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(space);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }

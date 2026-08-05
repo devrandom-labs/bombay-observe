@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/observepass", "crates/observepass-perf", "crates/observepass-harness"]
+members = ["crates/observepass", "crates/observepass-perf"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.96"
