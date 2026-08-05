@@ -296,3 +296,125 @@ fn dropping_observation_future_deregisters_waker() {
     assert!(!flag.0.load(Ordering::Relaxed));
     assert_eq!(space.observe(&7_u64).unwrap().try_get(), Some(9_u64));
 }
+
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicUsize};
+
+use triomphe::Arc as SlotArc;
+
+use crate::{Slot, SlotEntry, lock, write_lock};
+
+/// Cancellation after a waker migration deregisters BOTH registrations: a
+/// future polled first with waker A and later with a different waker B, then
+/// dropped, must not leave either waker registered to be fired by a later
+/// completion.
+#[test]
+fn future_drop_deregisters_migrated_waker() {
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    let flag_a = Arc::new(FlagWake(AtomicBool::new(false)));
+    let flag_b = Arc::new(FlagWake(AtomicBool::new(false)));
+    let waker_a = std::task::Waker::from(Arc::clone(&flag_a));
+    let waker_b = std::task::Waker::from(Arc::clone(&flag_b));
+    let mut ctx_a = std::task::Context::from_waker(&waker_a);
+    let mut ctx_b = std::task::Context::from_waker(&waker_b);
+
+    let mut future = Box::pin(observation.into_future());
+    assert!(future.as_mut().poll(&mut ctx_a).is_pending());
+    // A waker migration: the task moves to a different executor, so B is a
+    // genuinely different waker that the registration dedup cannot fold into A.
+    assert!(future.as_mut().poll(&mut ctx_b).is_pending());
+    // Box::pin, not pin!(): the value is owned by the Box, so dropping the
+    // future here is the real cancellation (pin!() only owns a Pin<&mut>
+    // handle and would defer the value's drop to the end of the scope).
+    drop(future); // cancellation
+
+    subject.complete(9_u64);
+    assert!(
+        !flag_a.0.load(Ordering::Relaxed),
+        "migrated-away waker A was woken after cancellation"
+    );
+    assert!(
+        !flag_b.0.load(Ordering::Relaxed),
+        "latest waker B was woken after cancellation"
+    );
+
+    // No waiter remains retained: the slot's registry is empty.
+    let entries = write_lock(&space.inner.entries);
+    let entry = entries.map.get(&7_u64).expect("subject retained");
+    let waiters = lock(entry.slot.waiters());
+    assert!(
+        waiters.is_empty(),
+        "waiter remains retained after cancellation"
+    );
+}
+
+/// The timeout boundary: completion racing the deadline must deliver either
+/// the outcome or a timed-out None - never both, never neither - and the
+/// waiter must be deregistered whichever side wins.
+#[test]
+fn wait_timeout_at_completion_boundary() {
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    let completer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        subject.complete(9_u64);
+    });
+    let result = observation.wait_timeout(Duration::from_millis(5));
+    match result {
+        Some(9) | None => {}
+        other => panic!("boundary race produced {other:?}"),
+    }
+    completer.join().unwrap();
+    assert_eq!(observation.try_get(), Some(9_u64));
+
+    // Whichever side won, the waiter registry is empty (the timeout path
+    // deregisters; the completion path drains). The observation outlives the
+    // subject's retirement, so its slot is still reachable here.
+    let waiters = lock(observation.slot.waiters());
+    assert!(
+        waiters.is_empty(),
+        "boundary wait left a registration behind"
+    );
+}
+
+/// A genuinely stale owner: a subject whose generation no longer matches the
+/// retained entry (only reachable internally - the public API forbids
+/// concurrent ownership via `SubjectExists`). Its retirement must not remove
+/// the replacement.
+#[test]
+fn stale_retirement_cannot_remove_replacement() {
+    let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+    let subject = space.subject(7_u64).unwrap();
+    let old_generation = subject.generation;
+
+    // Manually install a newer generation at the same key, as if a
+    // replacement subject had been created between the owner's liveness
+    // check and its retirement.
+    {
+        let mut entries = write_lock(&space.inner.entries);
+        let replacement = SlotArc::new(Slot {
+            state: AtomicUsize::new(0),
+            outcome: UnsafeCell::new(MaybeUninit::uninit()),
+            waiters: AtomicPtr::new(ptr::null_mut()),
+        });
+        entries.map.insert_vacant(
+            7_u64,
+            SlotEntry {
+                generation: old_generation + 1,
+                slot: replacement,
+            },
+        );
+    }
+
+    // The stale owner retires: the generation check must reject the removal.
+    drop(subject);
+    assert!(
+        space.observe(&7_u64).is_ok(),
+        "stale retirement removed the replacement entry"
+    );
+}

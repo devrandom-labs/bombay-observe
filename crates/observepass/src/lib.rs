@@ -850,7 +850,12 @@ impl<O> Observation<O> {
 /// payload alive or fire across generations.
 pub struct ObservationFuture<O> {
     observation: Observation<O>,
-    waker: Option<Waker>,
+    // Every distinct waker this future has polled with. A task can migrate
+    // between executors, registering a new waker each time (`will_wake`
+    // dedup only folds identical wakers), and cancellation must deregister
+    // all of them - remembering only the latest would leave earlier wakers
+    // registered to be fired after the future is dropped.
+    wakers: Vec<Waker>,
 }
 
 impl<O: Clone> Future for ObservationFuture<O> {
@@ -873,19 +878,28 @@ impl<O: Clone> Future for ObservationFuture<O> {
         if let Some(outcome) = this.observation.try_get() {
             return Poll::Ready(outcome);
         }
-        this.waker = Some(cx.waker().clone());
+        // Track this waker for cancellation, deduplicated exactly like the
+        // registration: repeated polling of the same task stays one entry,
+        // a migrated task accumulates its distinct wakers.
+        if !this.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            this.wakers.push(cx.waker().clone());
+        }
         Poll::Pending
     }
 }
 
 impl<O> Drop for ObservationFuture<O> {
     fn drop(&mut self) {
-        // Deregister the waker this future registered: cancelling the future
-        // must not leave a stale registration behind.
-        if let Some(waker) = &self.waker {
-            let mut waiters = lock(self.observation.slot.waiters());
-            waiters.retain(|waiter| !matches!(waiter, Waiter::Waker(w) if w.will_wake(waker)));
+        // Deregister every waker this future registered: cancelling the
+        // future must not leave a stale registration (including one from a
+        // pre-migration waker) behind.
+        if self.wakers.is_empty() {
+            return;
         }
+        let mut waiters = lock(self.observation.slot.waiters());
+        waiters.retain(|waiter| {
+            !matches!(waiter, Waiter::Waker(w) if self.wakers.iter().any(|mine| mine.will_wake(w)))
+        });
     }
 }
 
@@ -896,7 +910,7 @@ impl<O: Clone> IntoFuture for Observation<O> {
     fn into_future(self) -> Self::IntoFuture {
         ObservationFuture {
             observation: self,
-            waker: None,
+            wakers: Vec::new(),
         }
     }
 }

@@ -230,6 +230,51 @@ heap keys is the `key.clone()` into the map entry (inherent: both the entry
 and the Subject own the key; free for the `u64` keys of the frozen
 workload).
 
+## Review-fix pass: gate correction + waker migration cancellation (perf-neutral)
+
+External review found two issues; both fixed and verified.
+
+1. **The default gate ran the wrong loom target.** `.auto/checks.sh` ran
+   `cargo test -p observepass --test loom`, which is only a standalone
+   `Arc<Mutex<Option<_>>>` loom-harness demo in the frozen integration
+   tests - it never exercised the implementation. The 11 real models in
+   `src/loom_tests.rs` (compiled into the lib under `--cfg loom`) were not
+   in the gate, so CHECK OK did not verify the implementation's concurrency
+   models. The gate now runs
+   `cargo test -p observepass --test loom --lib --release` (both the smoke
+   and the in-crate models) at preemptions 3. The frozen-diff gate re-pins
+   the baseline to the corrected commit (this change is sanctioned: it
+   strengthens, never weakens, the gate).
+
+2. **Waker migration left a stale registration after cancellation.** The
+   future remembered only the latest waker; a task polled with waker A and
+   then a different waker B (a migration between executors) registered both
+   (the `will_wake` dedup only folds identical wakers), but `Drop`
+   deregistered only B - A remained registered and could be fired by a
+   later completion, contradicting the documented cancellation guarantee.
+   Fixed: `ObservationFuture` now tracks every distinct waker it has polled
+   with (a `Vec<Waker>`, deduplicated exactly like the registration) and
+   `Drop` deregisters all of them. The new test
+   (`future_drop_deregisters_migrated_waker`) polled with A, then B, dropped
+   the future, completed the subject, and asserted neither waker is woken
+   and no waiter remains retained; it fails on the pre-fix code
+   ("migrated-away waker A was woken after cancellation") and passes on the
+   fix. Note: the test must own the future via `Box::pin` - `pin!()` only
+   owns a `Pin<&mut>` handle, so dropping it defers the value's drop to the
+   end of the scope.
+
+3. **Coverage additions for previously-soft spots:**
+   - `wait_timeout_at_completion_boundary`: completion racing the deadline
+     delivers either the outcome or a timed-out `None` - never both, never
+     neither - and the waiter registry is empty whichever side wins.
+   - `stale_retirement_cannot_remove_replacement`: constructs a genuinely
+     stale owner internally (the public API forbids it via `SubjectExists`)
+     and proves the generation check blocks its retirement from removing
+     the replacement.
+
+Verification: std 18/18, loom 11/11 at preemptions 3 and 7, Miri 18/18,
+clippy clean, gate CHECK OK (after baseline re-pin).
+
 ## EXPERIMENT 17 - triomphe Arc, drop the weak count (kept, measured)
 
 Hypothesis (memory axis + layout): the std `Arc` header is 16B (strong +
