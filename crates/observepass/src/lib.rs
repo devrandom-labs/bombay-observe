@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::mem;
 use std::pin::Pin;
+use std::sync::OnceLock;
 #[cfg(loom)]
 use std::sync::PoisonError;
 #[cfg(not(loom))]
@@ -175,7 +176,10 @@ enum Waiter {
 struct Slot<O> {
     state: AtomicUsize,
     outcome: UnsafeCell<Option<O>>,
-    waiters: Mutex<Vec<Waiter>>,
+    // Created lazily on the first waiter: the common case (no waiters ever)
+    // keeps the slot 16 bytes smaller and allocation-free, and the hot path
+    // never touches this field.
+    waiters: OnceLock<Arc<Mutex<Vec<Waiter>>>>,
 }
 
 // SAFETY: the outcome cell is written exactly once, before the COMPLETED bit
@@ -257,6 +261,12 @@ impl<O> Slot<O> {
         });
     }
 
+    /// The waiters registry, created on first use.
+    fn waiters(&self) -> &Mutex<Vec<Waiter>> {
+        self.waiters
+            .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+    }
+
     /// Return a pooled slot to the pristine pending state for reuse by a new
     /// generation.
     fn reset(&self) {
@@ -269,7 +279,9 @@ impl<O> Slot<O> {
             // is retained in the pool or fired across generations. No waiter
             // can be in flight: a live waiter holds an observation Arc, and
             // pooled slots have none.
-            lock(&self.waiters).clear();
+            if let Some(waiters) = self.waiters.get() {
+                lock(waiters).clear();
+            }
         }
         self.state.store(0, Ordering::Release);
     }
@@ -461,7 +473,7 @@ where
             None => Arc::new(Slot {
                 state: AtomicUsize::new(0),
                 outcome: UnsafeCell::new(None),
-                waiters: Mutex::new(Vec::new()),
+                waiters: OnceLock::new(),
             }),
         };
         entries.map.insert_vacant(
@@ -524,7 +536,7 @@ where
         let previous = self.slot.state.fetch_or(COMPLETED, Ordering::Release);
         if previous & HAS_WAITER != 0 {
             let waiters = {
-                let mut waiters = lock(&self.slot.waiters);
+                let mut waiters = lock(self.slot.waiters());
                 mem::take(&mut *waiters)
             };
             for waiter in waiters {
@@ -605,7 +617,7 @@ impl<O: Clone> Observation<O> {
                     .clone();
             }
             self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
-            let mut waiters = lock(&self.slot.waiters);
+            let mut waiters = lock(self.slot.waiters());
             let thread_id = current().id();
             if !matches!(waiters.last(), Some(Waiter::Thread(t)) if t.id() == thread_id) {
                 waiters.push(Waiter::Thread(current()));
@@ -656,7 +668,7 @@ impl<O: Clone> Observation<O> {
                 );
             }
             self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
-            let mut waiters = lock(&self.slot.waiters);
+            let mut waiters = lock(self.slot.waiters());
             let thread_id = current().id();
             if !matches!(waiters.last(), Some(Waiter::Thread(t)) if t.id() == thread_id) {
                 waiters.push(Waiter::Thread(current()));
@@ -679,7 +691,7 @@ impl<O: Clone> Observation<O> {
                 if !park_until(deadline) {
                     // Deregister: the deadline passed while we were
                     // registered.
-                    let mut waiters = lock(&self.slot.waiters);
+                    let mut waiters = lock(self.slot.waiters());
                     waiters.retain(
                         |waiter| !matches!(waiter, Waiter::Thread(t) if t.id() == thread_id),
                     );
@@ -728,7 +740,7 @@ impl<O> Observation<O> {
             return true;
         }
         self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
-        let mut waiters = lock(&self.slot.waiters);
+        let mut waiters = lock(self.slot.waiters());
         if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
             // We may still be registered; a later drain produces only a
             // spurious wake, which callers must tolerate.
@@ -786,7 +798,7 @@ impl<O> Drop for ObservationFuture<O> {
         // Deregister the waker this future registered: cancelling the future
         // must not leave a stale registration behind.
         if let Some(waker) = &self.waker {
-            let mut waiters = lock(&self.observation.slot.waiters);
+            let mut waiters = lock(self.observation.slot.waiters());
             waiters.retain(|waiter| !matches!(waiter, Waiter::Waker(w) if w.will_wake(waker)));
         }
     }

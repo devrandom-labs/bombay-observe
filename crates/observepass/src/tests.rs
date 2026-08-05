@@ -247,7 +247,7 @@ fn register_waker_is_idempotent_per_task() {
     let observation = space.observe(&7_u64).unwrap();
     assert!(!observation.register_waker(&waker));
     assert!(!observation.register_waker(&waker));
-    let waiters = lock(&observation.slot.waiters);
+    let waiters = lock(observation.slot.waiters());
     assert_eq!(waiters.len(), 1);
     assert!(matches!(&waiters[0], Waiter::Waker(w) if w.will_wake(&waker)));
     drop(waiters);
