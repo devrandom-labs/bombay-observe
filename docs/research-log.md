@@ -139,6 +139,24 @@ Protocol:
   24.5M, 8t 11.4 -> 12.0M; alloc 0/op; retained 112B. Loom 9/9 (added
   `small_map_promotion_preserves_semantics`), Miri 5/5, gate green.
 
+## EXPERIMENT 11 - API contract completion (perf-neutral, kept)
+
+The prompt requires "typed and potentially move-only outcomes" and "an
+asynchronous actorpass adapter without runtime type erasure". The frozen
+`try_get`/`wait` need `O: Clone`; added two methods that complete the
+contract without changing the hot path:
+- `Observation::into_outcome(self) -> Option<O>`: moves the outcome by
+  value when this handle is the last slot reference (`Arc::try_unwrap` +
+  `UnsafeCell::into_inner`, exclusive by move). Supports non-`Clone`
+  outcomes; returns `None` while pending or shared.
+- `Observation::register_waker(&Waker) -> bool`: the std `Waker` hook for
+  async adapters, using the exact `HAS_WAITER` protocol as `wait` (SeqCst
+  RMW, recheck under the waiters lock, drain wakes). Waiters became
+  `enum Waiter { Thread, Waker }`; the drain match is off the hot path
+  (only runs when a waiter registered).
+Primary unchanged (49.6M). std 9/9, loom 10/10 (into_outcome racing
+complete never torn), Miri 9/9, gate green.
+
 ## Rejected: per-space observe cache
 
 An `AtomicU64`-keyed cache of the last observed slot could skip the observe
@@ -165,6 +183,7 @@ entries lock stays on the observe path.
 | 10 | EXP8: slot pool, nested pool Mutex | 27,702,717 | +254% | superseded by EXP9 (folded pool, no nested locks) |
 | 11 | EXP9: pool folded into Entries{map,pool} behind one mutex | 28,720,880 | +267% | keep |
 | 12 | EXP10: SmallMap hybrid (inline Vec <=4, promotes to HashMap) | 49,685,943 | +536% | keep |
+| 13 | EXP11: into_outcome (move-only) + register_waker (async hook) | 49,630,870 | +535% | keep (perf-neutral contract completion) |
 
 Final design: single `Mutex<Entries { map: SmallMap<K, SlotEntry>, pool:
 Vec<Arc<Slot>> }>` key table (parking_lot; SmallMap = inline Vec <= 4
@@ -187,13 +206,15 @@ after-drop residue 1088 B (no leak).
   observations into pure `ChildStopped`/`PeerStopped` events.
 - `Observation::try_get` is lock-free (single Acquire load + clone): safe on
   any thread. `Observation::wait` parks the calling thread and wakes on
-  completion (p50 2.7 us on macOS); for async use, the slot's
-  HAS_WAITER/waiter-registry protocol extends to a waker slot: register a
-  `std::task::Waker` instead of a `Thread`, wake it from the drain. No Tokio,
-  no actor vocabulary, no runtime type erasure: the API is generic over
-  `K`/`O`; `O` needs `Clone` for `try_get`/`wait` and `Send + Sync` for the
-  observation to be shareable across threads (outcome becomes immutable at
-  publication).
+  completion (p50 2.5 us on macOS). Async adapters call
+  `Observation::register_waker(&Waker)` (std `Waker`, no Tokio) - same
+  HAS_WAITER protocol; returns true when already published; wakers may fire
+  spuriously, callers re-read. Move-only outcomes use
+  `Observation::into_outcome` (moves out when the handle is the last slot
+  reference). No actor vocabulary, no runtime type erasure: the API is
+  generic over `K`/`O`; `O` needs `Clone` for `try_get`/`wait` and
+  `Send + Sync` for the observation to be shareable across threads (outcome
+  becomes immutable at publication).
 - Cancellation: dropping an `Observation` never touches the slot; it cannot
   obstruct completion.
 - Retention: bounded by explicit ownership (Subject retains the key entry;
