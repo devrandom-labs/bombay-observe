@@ -1,11 +1,59 @@
 //! Generation-safe completion publication and observation.
 
-use core::hash::Hash;
+use core::hash::{BuildHasherDefault, Hash, Hasher};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::mem;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Fixed-seed 64-bit multiply-xor-rotate hasher (rustc's `FxHash`, as in the
+/// `rustc-hash` crate). Deterministic across runs and fast for small keys;
+/// not collision-hardened, so it is only used for the internal key table,
+/// whose keys come from the embedding application rather than an adversary.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(
+                chunk.try_into().expect("chunk is 8 bytes"),
+            ));
+        }
+        let tail = chunks.remainder();
+        if !tail.is_empty() {
+            let mut padded = [0_u8; 8];
+            padded[..tail.len()].copy_from_slice(tail);
+            self.add(u64::from_le_bytes(padded));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type BuildFx = BuildHasherDefault<FxHasher>;
 
 #[cfg(loom)]
 use loom::sync::{Arc, Mutex};
@@ -48,7 +96,7 @@ struct Inner<K, O> {
     // is only compared under the `entries` mutex, whose acquire/release
     // orders the entry's publication. Relaxed is therefore sufficient.
     next_generation: AtomicUsize,
-    entries: Mutex<HashMap<K, SlotEntry<O>>>,
+    entries: Mutex<HashMap<K, SlotEntry<O>, BuildFx>>,
 }
 
 /// Shared completion namespace.
@@ -77,7 +125,7 @@ impl<K, O> ObservationSpace<K, O> {
         Self {
             inner: Arc::new(Inner {
                 next_generation: AtomicUsize::new(1),
-                entries: Mutex::new(HashMap::new()),
+                entries: Mutex::new(HashMap::with_hasher(BuildFx::default())),
             }),
         }
     }
