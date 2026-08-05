@@ -3,21 +3,38 @@
 use core::hash::Hash;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::mem;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(loom)]
-use loom::sync::{Arc, Condvar, Mutex};
+use loom::sync::{Arc, Mutex};
+#[cfg(loom)]
+use loom::thread::{Thread, current, park};
 #[cfg(not(loom))]
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+#[cfg(not(loom))]
+use std::thread::{Thread, current, park};
 
 fn recover<T>(error: PoisonError<T>) -> T {
     error.into_inner()
 }
 
+/// Per-subject completion cell: the outcome plus every thread blocked in
+/// [`Observation::wait`] on this generation.
+///
+/// Registration and publication happen under the same mutex, so they cannot
+/// interleave. A waiter registered before completion is guaranteed to wake:
+/// `unpark` makes the thread's token available, and `park` consumes an
+/// already-available token without blocking (std token semantics). Waiters
+/// are drained and unparked after releasing the lock.
 struct Slot<O> {
-    outcome: Mutex<Option<O>>,
-    completed: Condvar,
+    state: Mutex<SlotState<O>>,
+}
+
+struct SlotState<O> {
+    outcome: Option<O>,
+    waiters: Vec<Thread>,
 }
 
 struct SlotEntry<O> {
@@ -93,8 +110,10 @@ where
                 let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
                 assert_ne!(generation, usize::MAX, "observation generation exhausted");
                 let slot = Arc::new(Slot {
-                    outcome: Mutex::new(None),
-                    completed: Condvar::new(),
+                    state: Mutex::new(SlotState {
+                        outcome: None,
+                        waiters: Vec::new(),
+                    }),
                 });
                 vacant.insert(SlotEntry {
                     generation,
@@ -147,9 +166,14 @@ where
     /// Panics when the same subject publishes completion more than once.
     pub fn complete(&mut self, outcome: O) {
         assert!(!self.completed, "subject completed twice");
-        *self.slot.outcome.lock().unwrap_or_else(recover) = Some(outcome);
+        let mut state = self.slot.state.lock().unwrap_or_else(recover);
+        state.outcome = Some(outcome);
         self.completed = true;
-        self.slot.completed.notify_all();
+        let waiters = mem::take(&mut state.waiters);
+        drop(state);
+        for waiter in waiters {
+            waiter.unpark();
+        }
     }
 }
 
@@ -177,20 +201,38 @@ impl<O: Clone> Observation<O> {
     /// Return the outcome without blocking when already complete.
     #[must_use]
     pub fn try_get(&self) -> Option<O> {
-        self.slot.outcome.lock().unwrap_or_else(recover).clone()
+        self.slot
+            .state
+            .lock()
+            .unwrap_or_else(recover)
+            .outcome
+            .clone()
     }
 
     /// Block the current thread until completion.
+    ///
+    /// The waiter registers its thread handle under the slot mutex, re-checks
+    /// the outcome, and only then parks. A completion that raced the
+    /// registration either publishes before the re-check (seen without
+    /// parking) or drains the registration and sets the unpark token (the
+    /// park then returns immediately). Nothing that could itself park runs
+    /// between registration and [`park`], so the token cannot be consumed
+    /// elsewhere.
     pub fn wait(&self) -> O {
-        let mut outcome = self.slot.outcome.lock().unwrap_or_else(recover);
+        let mut state = self.slot.state.lock().unwrap_or_else(recover);
         loop {
-            if let Some(outcome) = outcome.clone() {
+            if let Some(outcome) = state.outcome.clone() {
                 return outcome;
             }
-            outcome = self.slot.completed.wait(outcome).unwrap_or_else(recover);
+            state.waiters.push(current());
+            drop(state);
+            park();
+            state = self.slot.state.lock().unwrap_or_else(recover);
         }
     }
 }
 
 #[cfg(all(test, loom))]
 mod loom_tests;
+#[cfg(all(test, not(loom)))]
+mod tests;
