@@ -418,3 +418,30 @@ fn stale_retirement_cannot_remove_replacement() {
         "stale retirement removed the replacement entry"
     );
 }
+
+/// A zero timeout is the deterministic deadline boundary: the wait returns
+/// `None` immediately (never blocking) and deregisters, leaving no waiter
+/// behind - the exact edge the racing boundary test cannot pin down.
+#[test]
+fn wait_timeout_zero_times_out_immediately() {
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    let started = Instant::now();
+    assert_eq!(observation.wait_timeout(Duration::ZERO), None);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "zero timeout must not block"
+    );
+    // The immediate-timeout path deregisters: no waiter remains. The guard
+    // must drop before `complete` (its drain takes the same mutex).
+    {
+        let waiters = lock(observation.slot.waiters());
+        assert!(
+            waiters.is_empty(),
+            "zero-timeout wait left a registration behind"
+        );
+    }
+    subject.complete(9_u64);
+    assert_eq!(observation.try_get(), Some(9_u64));
+}
