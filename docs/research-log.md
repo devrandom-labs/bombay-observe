@@ -230,6 +230,31 @@ heap keys is the `key.clone()` into the map entry (inherent: both the entry
 and the Subject own the key; free for the `u64` keys of the frozen
 workload).
 
+## EXPERIMENT 16 - waiters AtomicPtr, drop the Arc indirection (kept, measured)
+
+Hypothesis (memory-efficiency axis): EXP14's `OnceLock<Arc<Mutex<Vec<Waiter>>>>`
+(16B inline, 40B heap) still carries an unnecessary `Arc`: the registry mutex
+is owned by the slot itself, which outlives every waiter, so a shared
+ownership token is pointless. Replaced with `AtomicPtr<Mutex<Vec<Waiter>>>`
+(8B inline, 32B heap): null until the first waiter; the first access
+`Box::into_raw`s a fresh `Mutex<Vec<Waiter>>` and CAS-publishes it (a loser
+of the init race reclaims its own box and uses the winner's); the slot's
+final `Drop` reclaims the box (`Box::from_raw`). Slot 32->24B (48->40B with
+the Arc header); retained 88->80B (-9%); alloc stays 0/op; primary 54.3M
+(within the AC range). The field remains entirely off the hot path.
+
+New unsafe invariant (replaces EXPERIMENT 14's OnceLock clause): the waiters
+pointer, when non-null, points to a `Box<Mutex<Vec<Waiter>>>` owned by the
+slot; it is published by the init CAS (Release) and reclaimed only by the
+slot's final drop (the last Arc reference), so every access to it happens
+while the slot is live (an Acquire load returns either null or a live
+pointer). Losing the init race reclaims the loser's box, which was never
+published.
+
+Verification: std 15/15, loom 11/11 at preemptions 3 and 7 (the multi-waiter
+models exercise the CAS-init race), Miri 15/15 (including the `Box::from_raw`
+reclaim under the real-thread model), clippy clean, gate CHECK OK.
+
 ## EXPERIMENT 14 - lazy waiters (kept, measured)
 
 Hypothesis (memory-efficiency axis): every slot carries a 32B inline
