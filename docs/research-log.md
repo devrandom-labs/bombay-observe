@@ -120,6 +120,25 @@ Protocol:
   8t 8.5M -> 11.4M; alloc 0 blocks / 0 bytes per op; retained unchanged
   (112 B); loom 8/8, Miri 5/5.
 
+## EXPERIMENT 10 - SmallMap hybrid key storage (kept)
+
+- Observation: with the pool (EXP9) the op was ~20-23 ns and the key table's
+  hash+probe work was a large, avoidable share for the transient actorpass
+  case (~1 live entry): `HashMap` still hashes and probes on every
+  subject/observe/retire even at size 1.
+- Hypothesis: an inline `Vec<(K, SlotEntry)>` (Eq-only linear scan, no
+  hashing) for the first `INLINE_CAP = 4` live entries, promoting to the
+  FxHash `HashMap` beyond that, preserves O(1) retention-scale behavior
+  while cutting the transient map cost to a 1-2 element scan.
+- Promotion is one-time (never demotes); the inline Vec's capacity is stable
+  under the transient workload, so the 0-allocations-per-op property is
+  preserved. Semantics unchanged (vacancy check, generation-checked retire,
+  stale-retire restore).
+- Result: primary 28.7M -> 49.7M (+73%; A/B verified over 3 runs each:
+  48.8-50.3M vs 26.2-28.1M). retire_recreate 70.1M; contention 4t 19.5 ->
+  24.5M, 8t 11.4 -> 12.0M; alloc 0/op; retained 112B. Loom 9/9 (added
+  `small_map_promotion_preserves_semantics`), Miri 5/5, gate green.
+
 ## Rejected: per-space observe cache
 
 An `AtomicU64`-keyed cache of the last observed slot could skip the observe
@@ -145,17 +164,19 @@ entries lock stays on the observe path.
 | 9 | harness: wait_roundtrip p50/p99 scenario | 27,932,473 | +257% | keep (no lib change) |
 | 10 | EXP8: slot pool, nested pool Mutex | 27,702,717 | +254% | superseded by EXP9 (folded pool, no nested locks) |
 | 11 | EXP9: pool folded into Entries{map,pool} behind one mutex | 28,720,880 | +267% | keep |
+| 12 | EXP10: SmallMap hybrid (inline Vec <=4, promotes to HashMap) | 49,685,943 | +536% | keep |
 
-Final design: single `Mutex<Entries { map: HashMap<K, SlotEntry, FxHasher>,
-pool: Vec<Arc<Slot>> }>` key table (parking_lot) + generation counter
-`AtomicUsize` + lock-free slot (single-word state: COMPLETED | HAS_WAITER;
+Final design: single `Mutex<Entries { map: SmallMap<K, SlotEntry>, pool:
+Vec<Arc<Slot>> }>` key table (parking_lot; SmallMap = inline Vec <= 4
+entries promoting to FxHash HashMap) + generation counter `AtomicUsize` +
+lock-free slot (single-word state: COMPLETED | HAS_WAITER;
 `UnsafeCell<Option<O>>`; waiters under their own `parking_lot::Mutex<Vec<Thread>>`)
 + recycled-slot pool (retire-time strong-count proof, cap 128).
 
-Final numbers (run #11): primary 28.72M; seq_observe_first 44.0M,
-seq_complete_first 43.8M, retire_recreate 44.2M, cancel 43.3M;
-fanout(8) 133.4M observations/s; hot path p50/p99 41/42 ns; wait round-trip
-p50/p99 2.2/6.6 us; contention 1t/4t/8t 43.7M/19.5M/11.4M; alloc 0 B / 0
+Final numbers (run #12): primary 49.69M; seq_observe_first 51.4M,
+seq_complete_first 49.6M, retire_recreate 70.1M, cancel 51.7M;
+fanout(8) 149.3M observations/s; hot path p50/p99 41/42 ns; wait round-trip
+p50/p99 2.3/6.1 us; contention 1t/4t/8t 51.6M/24.5M/12.0M; alloc 0 B / 0
 blocks per op (pooled); retained 112 B / 1 block per subject+observer;
 after-drop residue 1088 B (no leak).
 
