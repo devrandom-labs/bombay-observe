@@ -209,6 +209,27 @@ All fixes perf-neutral (3 direct runs 50.41-50.52M, identical to the
 pre-fix stable value). std 12/12, loom 11/11 at preemptions 3 and 7, Miri
 12/12, gate green.
 
+## arXiv literature check (recorded honestly)
+
+The arXiv API (export.arxiv.org) was queried for the mechanism's topics:
+"eventcount"/"event count" (no results - the eventcount literature lives on
+Vyukov's 1024cores site, already recorded), async-Rust futures/cancellation
+(closest hits: "Deadlock-free asynchronous message reordering in Rust with
+multiparty session types", "Provably Fair Cooperative Scheduling" - both
+tangential), and wakeup/notification primitives (no results). Conclusion:
+the specific primitive (a keyed completion-observation cell with thread +
+waker registration, dedup, and drop-based cancellation) has no direct arXiv
+literature; its foundations are the primary sources already recorded here
+(Vyukov eventcounts; std `park`/`unpark` token semantics; std `Waker`
+source - `will_wake`/`clone_from`; tokio `AtomicWaker`; the async-Rust
+cancellation analysis). Allocation audit of the per-op path (subject +
+observe + complete + try_get + retire): zero heap allocations - the pool
+eliminated the slot alloc, the inline SmallMap avoids map reallocation, the
+dedup eliminated repeated waker pushes; the only per-subject allocation for
+heap keys is the `key.clone()` into the map entry (inherent: both the entry
+and the Subject own the key; free for the `u64` keys of the frozen
+workload).
+
 ## Waker-registration review pass (all feedback points addressed)
 
 External review feedback on the async registration path, addressed with
