@@ -1,0 +1,110 @@
+//! Loom models over the real implementation (map side, generation safety,
+//! completion publication, and the blocking wait path).
+//!
+//! Runs with `RUSTFLAGS="--cfg loom" cargo test -p observepass --lib
+//! --release`; the frozen gate runs these with `LOOM_MAX_PREEMPTIONS=3`.
+
+use loom::thread;
+use loom::thread::yield_now;
+
+use crate::ObservationSpace;
+
+/// Registration racing completion must not lose a published outcome: an
+/// observer that captured the slot before completion still reads it after.
+#[test]
+fn observe_racing_complete_never_loses_outcome() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let mut subject = space.subject(7_u64).unwrap();
+        let observation = space.observe(&7_u64).unwrap();
+        let observer = thread::spawn(move || {
+            loop {
+                if let Some(outcome) = observation.try_get() {
+                    return outcome;
+                }
+                yield_now();
+            }
+        });
+        subject.complete(42_u64);
+        assert_eq!(observer.join().unwrap(), 42_u64);
+    });
+}
+
+/// A late retire (drop of an older subject handle) must not remove a
+/// replacement generation at the same key.
+#[test]
+fn stale_retire_cannot_remove_replacement() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let subject_one = space.subject(7_u64).unwrap();
+        let retire = thread::spawn(move || drop(subject_one));
+        // Registration may fail until the old generation is retired; retry
+        // until the replacement exists.
+        let mut replacement = None;
+        while replacement.is_none() {
+            if let Ok(subject) = space.subject(7_u64) {
+                replacement = Some(subject);
+            } else {
+                yield_now();
+            }
+        }
+        retire.join().unwrap();
+        // The replacement generation is still retained and observable.
+        assert!(space.observe(&7_u64).is_ok());
+        assert!(space.subject(7_u64).is_err());
+    });
+}
+
+/// Concurrent registration at one key: exactly one subject wins.
+#[test]
+fn concurrent_subject_one_winner() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        // The winner's `Subject` stays alive inside the join result, so the
+        // entry remains retained until both registrations have happened.
+        let first = thread::spawn({
+            let space = space.clone();
+            move || space.subject(7_u64)
+        });
+        let second = thread::spawn({
+            let space = space.clone();
+            move || space.subject(7_u64)
+        });
+        // Both results (holding the winner's `Subject`) stay alive until
+        // after both joins, so the retained entry is visible to the second
+        // registration in every schedule.
+        let first_result = first.join().unwrap();
+        let second_result = second.join().unwrap();
+        assert_eq!(
+            u8::from(first_result.is_ok()) + u8::from(second_result.is_ok()),
+            1
+        );
+    });
+}
+
+/// A blocking observer is woken by completion with the published outcome,
+/// including the registration-races-completion interleavings.
+#[test]
+fn waiter_wakes_with_outcome() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let mut subject = space.subject(7_u64).unwrap();
+        let observation = space.observe(&7_u64).unwrap();
+        let observer = thread::spawn(move || observation.wait());
+        yield_now();
+        subject.complete(9_u64);
+        assert_eq!(observer.join().unwrap(), 9_u64);
+    });
+}
+
+/// Completion before registration: a late observer reads the retained outcome.
+#[test]
+fn late_observer_reads_retained_outcome() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let mut subject = space.subject(7_u64).unwrap();
+        subject.complete(5_u64);
+        let observation = space.observe(&7_u64).unwrap();
+        assert_eq!(observation.try_get(), Some(5_u64));
+    });
+}

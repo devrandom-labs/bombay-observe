@@ -2,7 +2,14 @@
 
 use core::hash::Hash;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::collections::hash_map::Entry;
+use std::sync::PoisonError;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(loom)]
+use loom::sync::{Arc, Condvar, Mutex};
+#[cfg(not(loom))]
+use std::sync::{Arc, Condvar, Mutex};
 
 fn recover<T>(error: PoisonError<T>) -> T {
     error.into_inner()
@@ -13,14 +20,18 @@ struct Slot<O> {
     completed: Condvar,
 }
 
-struct Entry<O> {
-    generation: u64,
+struct SlotEntry<O> {
+    generation: usize,
     slot: Arc<Slot<O>>,
 }
 
 struct Inner<K, O> {
-    next_generation: Mutex<u64>,
-    entries: Mutex<HashMap<K, Entry<O>>>,
+    // Monotonic generation source. `fetch_add` is a read-modify-write, so
+    // every call observes a distinct value regardless of ordering; the value
+    // is only compared under the `entries` mutex, whose acquire/release
+    // orders the entry's publication. Relaxed is therefore sufficient.
+    next_generation: AtomicUsize,
+    entries: Mutex<HashMap<K, SlotEntry<O>>>,
 }
 
 /// Shared completion namespace.
@@ -48,7 +59,7 @@ impl<K, O> ObservationSpace<K, O> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
-                next_generation: Mutex::new(1),
+                next_generation: AtomicUsize::new(1),
                 entries: Mutex::new(HashMap::new()),
             }),
         }
@@ -73,35 +84,31 @@ where
     /// Returns [`SubjectExists`] while the current generation remains retained.
     ///
     /// # Panics
-    /// Panics if the process exhausts all `u64` generations.
+    /// Panics if the process exhausts all generations.
     pub fn subject(&self, key: K) -> Result<Subject<K, O>, SubjectExists<K>> {
         let mut entries = self.inner.entries.lock().unwrap_or_else(recover);
-        if entries.contains_key(&key) {
-            return Err(SubjectExists(key));
+        match entries.entry(key.clone()) {
+            Entry::Occupied(_) => Err(SubjectExists(key)),
+            Entry::Vacant(vacant) => {
+                let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
+                assert_ne!(generation, usize::MAX, "observation generation exhausted");
+                let slot = Arc::new(Slot {
+                    outcome: Mutex::new(None),
+                    completed: Condvar::new(),
+                });
+                vacant.insert(SlotEntry {
+                    generation,
+                    slot: slot.clone(),
+                });
+                Ok(Subject {
+                    inner: self.inner.clone(),
+                    key,
+                    generation,
+                    slot,
+                    completed: false,
+                })
+            }
         }
-        let mut next = self.inner.next_generation.lock().unwrap_or_else(recover);
-        let generation = *next;
-        *next = next
-            .checked_add(1)
-            .expect("observation generation exhausted");
-        let slot = Arc::new(Slot {
-            outcome: Mutex::new(None),
-            completed: Condvar::new(),
-        });
-        entries.insert(
-            key.clone(),
-            Entry {
-                generation,
-                slot: slot.clone(),
-            },
-        );
-        Ok(Subject {
-            inner: self.inner.clone(),
-            key,
-            generation,
-            slot,
-            completed: false,
-        })
     }
 
     /// Observe the current generation, including an already completed one.
@@ -125,7 +132,7 @@ where
 {
     inner: Arc<Inner<K, O>>,
     key: K,
-    generation: u64,
+    generation: usize,
     slot: Arc<Slot<O>>,
     completed: bool,
 }
@@ -184,3 +191,6 @@ impl<O: Clone> Observation<O> {
         }
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_tests;
