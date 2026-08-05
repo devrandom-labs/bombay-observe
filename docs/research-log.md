@@ -257,6 +257,11 @@ replaced in place). No API constraint added.
 
 Verification: std 15/15, loom 11/11 at preemptions 3 and 7 (cfg(loom)
 unchanged - loom's own Arc), Miri 15/15, clippy clean, gate CHECK OK.
+Frozen criterion cross-check after the change: complete_then_observe 18.37ns
+CI [18.355, 18.388] (was 18.8ns pre-EXP17) - the SUT-direct latency improves
+slightly; the harness's fuller scenarios (which also exercise the subject,
+retire, pool, and map on the same slot allocation) gained more (primary
+51-54M -> 56M, retire_recreate 72M -> 81M, 8t 10.5M -> 14.8M).
 
 ## EXPERIMENT 16 - waiters AtomicPtr, drop the Arc indirection (kept, measured)
 
