@@ -233,6 +233,14 @@ impl<O> Slot<O> {
         // SAFETY: pooled slots have no observers (see `Subject::drop`), so
         // the cell is unobservable; the Release store publishes the clear.
         unsafe { self.clear_outcome() };
+        if self.state.load(Ordering::Relaxed) & HAS_WAITER != 0 {
+            // A stale registration can survive (a waker whose caller dropped
+            // its observation before completion). Drain it so no dead waiter
+            // is retained in the pool or fired across generations. No waiter
+            // can be in flight: a live waiter holds an observation Arc, and
+            // pooled slots have none.
+            lock(&self.waiters).clear();
+        }
         self.state.store(0, Ordering::Release);
     }
 }
@@ -568,12 +576,16 @@ impl<O: Clone> Observation<O> {
             }
             self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
             let mut waiters = lock(&self.slot.waiters);
-            waiters.push(Waiter::Thread(current()));
+            let thread_id = current().id();
+            if !matches!(waiters.last(), Some(Waiter::Thread(t)) if t.id() == thread_id) {
+                waiters.push(Waiter::Thread(current()));
+            }
             if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
                 // SAFETY: COMPLETED observed with SeqCst (invariant 2), so the
-                // outcome is present. We may still be registered; a later
-                // drain only produces a spurious token, consumed by our next
-                // park.
+                // outcome is present. Deregister: we are in the Vec, and a
+                // stale registration must not survive into a pooled slot.
+                waiters
+                    .retain(|waiter| !matches!(waiter, Waiter::Thread(t) if t.id() == thread_id));
                 return unsafe { self.slot.outcome_ref() }
                     .expect("completed slot holds an outcome")
                     .clone();
@@ -592,8 +604,9 @@ impl<O: Clone> Observation<O> {
     /// a spurious wake.
     ///
     /// # Panics
-    /// Panics only if the completed-bit protocol is violated (a programmer
-    /// a bug); a slot that reports completion always holds an outcome.
+    /// Panics if the completed-bit protocol is violated (a programmer bug; a
+    /// slot that reports completion always holds an outcome), or if `timeout`
+    /// overflows the [`Instant`] deadline.
     #[must_use]
     pub fn wait_timeout(&self, timeout: Duration) -> Option<O> {
         let deadline = Instant::now()
@@ -611,10 +624,16 @@ impl<O: Clone> Observation<O> {
             }
             self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
             let mut waiters = lock(&self.slot.waiters);
-            waiters.push(Waiter::Thread(current()));
+            let thread_id = current().id();
+            if !matches!(waiters.last(), Some(Waiter::Thread(t)) if t.id() == thread_id) {
+                waiters.push(Waiter::Thread(current()));
+            }
             if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
                 // SAFETY: COMPLETED observed with SeqCst (invariant 2), so
-                // the outcome is present.
+                // the outcome is present. Deregister: we are in the Vec, and
+                // a stale registration must not survive into a pooled slot.
+                waiters
+                    .retain(|waiter| !matches!(waiter, Waiter::Thread(t) if t.id() == thread_id));
                 return Some(
                     unsafe { self.slot.outcome_ref() }
                         .expect("completed slot holds an outcome")
@@ -625,6 +644,12 @@ impl<O: Clone> Observation<O> {
             #[cfg(not(loom))]
             {
                 if !park_until(deadline) {
+                    // Deregister: the deadline passed while we were
+                    // registered.
+                    let mut waiters = lock(&self.slot.waiters);
+                    waiters.retain(
+                        |waiter| !matches!(waiter, Waiter::Thread(t) if t.id() == thread_id),
+                    );
                     return None;
                 }
             }
