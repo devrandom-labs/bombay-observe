@@ -1,3 +1,4 @@
-/target
-criterion/
-
+target/
+mutants.out/
+mutants.out.old/
+.direnv/
