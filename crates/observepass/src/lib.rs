@@ -9,6 +9,7 @@ use std::mem;
 use std::sync::PoisonError;
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Waker;
 
 /// Fixed-seed 64-bit multiply-xor-rotate hasher (rustc's `FxHash`, as in the
 /// `rustc-hash` crate). Deterministic across runs and fast for small keys;
@@ -98,6 +99,13 @@ fn recover<T>(error: PoisonError<T>) -> T {
 const COMPLETED: usize = 1 << 0;
 const HAS_WAITER: usize = 1 << 1;
 
+/// A registered waiter: either a blocked thread (sync [`Observation::wait`])
+/// or an async waker ([`Observation::register_waker`]).
+enum Waiter {
+    Thread(Thread),
+    Waker(Waker),
+}
+
 /// Per-subject completion cell: a lock-free outcome publication point plus a
 /// mutex-protected waiter registry.
 ///
@@ -116,7 +124,7 @@ const HAS_WAITER: usize = 1 << 1;
 struct Slot<O> {
     state: AtomicUsize,
     outcome: UnsafeCell<Option<O>>,
-    waiters: Mutex<Vec<Thread>>,
+    waiters: Mutex<Vec<Waiter>>,
 }
 
 // SAFETY: the outcome cell is written exactly once, before the COMPLETED bit
@@ -457,7 +465,10 @@ where
                 mem::take(&mut *waiters)
             };
             for waiter in waiters {
-                waiter.unpark();
+                match waiter {
+                    Waiter::Thread(thread) => thread.unpark(),
+                    Waiter::Waker(waker) => waker.wake(),
+                }
             }
         }
     }
@@ -532,7 +543,7 @@ impl<O: Clone> Observation<O> {
             }
             self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
             let mut waiters = lock(&self.slot.waiters);
-            waiters.push(current());
+            waiters.push(Waiter::Thread(current()));
             if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
                 // SAFETY: COMPLETED observed with SeqCst (invariant 2), so the
                 // outcome is present. We may still be registered; a later
@@ -545,6 +556,51 @@ impl<O: Clone> Observation<O> {
             drop(waiters);
             park();
         }
+    }
+}
+
+impl<O> Observation<O> {
+    /// Consume this observation and return the outcome by value, if the
+    /// outcome is published and this handle is the last reference to the
+    /// slot (no other observation, waiter, or the subject still holds it).
+    ///
+    /// Unlike [`Observation::try_get`], this supports outcomes that are not
+    /// `Clone`: the value moves out of the slot. It returns `None` while the
+    /// slot is still shared or the outcome is not yet published.
+    #[must_use]
+    pub fn into_outcome(self) -> Option<O> {
+        let slot = Arc::try_unwrap(self.slot).ok()?;
+        // Exclusive ownership via the move; `into_inner` consumes the cell,
+        // so no access can race it.
+        if slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
+            slot.outcome.into_inner()
+        } else {
+            None
+        }
+    }
+
+    /// Register a waker to be woken when the outcome is published, for
+    /// async adapters. Returns `true` when the outcome is already published
+    /// (in which case nothing is registered and the caller can read the
+    /// outcome directly).
+    ///
+    /// The waker may be woken spuriously and more than once; callers must
+    /// re-read the outcome (via [`Observation::try_get`] or
+    /// [`Observation::into_outcome`]) after a wake.
+    #[must_use]
+    pub fn register_waker(&self, waker: &Waker) -> bool {
+        if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
+            return true;
+        }
+        self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
+        let mut waiters = lock(&self.slot.waiters);
+        if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
+            // We may still be registered; a later drain produces only a
+            // spurious wake, which callers must tolerate.
+            return true;
+        }
+        waiters.push(Waiter::Waker(waker.clone()));
+        false
     }
 }
 

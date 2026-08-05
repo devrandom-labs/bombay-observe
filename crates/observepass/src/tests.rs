@@ -77,3 +77,71 @@ fn cancelled_observer_does_not_block_completion() {
     subject.complete(5_u64);
     assert_eq!(observer.try_get(), Some(5_u64));
 }
+
+/// Move-only outcomes: `into_outcome` moves the value out when this handle
+/// is the last reference to the slot.
+#[test]
+fn into_outcome_moves_non_clone_outcome() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct Handle(u64);
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    subject.complete(Handle(5));
+    drop(subject);
+    assert_eq!(observation.into_outcome(), Some(Handle(5)));
+}
+
+/// `into_outcome` returns `None` while the outcome is pending or the slot is
+/// still shared, and succeeds for the last reference after retirement.
+#[test]
+fn into_outcome_none_while_shared_or_pending() {
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let pending = space.observe(&7_u64).unwrap();
+    assert_eq!(pending.into_outcome(), None);
+    subject.complete(9_u64);
+    let shared = space.observe(&7_u64).unwrap();
+    assert_eq!(shared.into_outcome(), None);
+    let last = space.observe(&7_u64).unwrap();
+    drop(subject);
+    assert_eq!(last.into_outcome(), Some(9_u64));
+}
+
+/// A registered waker fires when the outcome is published.
+#[test]
+fn register_waker_wakes_on_completion() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Wake;
+
+    struct FlagWake(AtomicBool);
+    impl Wake for FlagWake {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    let flag = Arc::new(FlagWake(AtomicBool::new(false)));
+    let waker = std::task::Waker::from(Arc::clone(&flag));
+    assert!(!observation.register_waker(&waker));
+    subject.complete(9_u64);
+    assert!(flag.0.load(Ordering::Relaxed));
+    assert_eq!(observation.try_get(), Some(9_u64));
+}
+
+/// Registration after publication reports the outcome as already available.
+#[test]
+fn register_waker_after_completion_returns_true() {
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    subject.complete(3_u64);
+    let observation = space.observe(&7_u64).unwrap();
+    assert!(observation.register_waker(std::task::Waker::noop()));
+}

@@ -174,3 +174,21 @@ fn waiter_after_completion_returns_immediately() {
         assert_eq!(observation.wait(), 4_u64);
     });
 }
+
+/// `into_outcome` racing completion is never torn: it either sees the
+/// pending state or the fully published outcome.
+#[test]
+fn into_outcome_racing_complete() {
+    loom::model(|| {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Handle(u64);
+        let space: ObservationSpace<u64, Handle> = ObservationSpace::new();
+        let mut subject = space.subject(7_u64).unwrap();
+        let observation = space.observe(&7_u64).unwrap();
+        let observer = thread::spawn(move || observation.into_outcome());
+        subject.complete(Handle(9));
+        drop(subject);
+        let result = observer.join().unwrap();
+        assert!(result.is_none() || result == Some(Handle(9)));
+    });
+}
