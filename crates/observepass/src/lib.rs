@@ -5,7 +5,7 @@ use core::hash::{BuildHasherDefault, Hash, Hasher};
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
-use std::mem;
+use std::mem::{self, MaybeUninit};
 use std::pin::Pin;
 use std::sync::OnceLock;
 #[cfg(loom)]
@@ -150,6 +150,11 @@ fn park_until() -> bool {
 /// Completion-state bits for [`Slot`].
 const COMPLETED: usize = 1 << 0;
 const HAS_WAITER: usize = 1 << 1;
+/// Set exactly while the outcome cell holds a live value. Rides the state
+/// word (set by `complete`'s RMW, cleared by `reset`'s recycle and
+/// `into_outcome`'s take) so the outcome cell needs no separate tag: the
+/// validity gate is `COMPLETED` for readers, `OUTCOME_VALID` for droppers.
+const OUTCOME_VALID: usize = 1 << 2;
 
 /// A registered waiter: either a blocked thread (sync [`Observation::wait`])
 /// or an async waker ([`Observation::register_waker`]).
@@ -164,10 +169,14 @@ enum Waiter {
 /// The full safety argument is recorded in `docs/research-log.md`
 /// (EXPERIMENT 6). Summary of the invariants:
 /// - The outcome cell is written exactly once, by `complete`, and the write
-///   happens-before the COMPLETED bit is set by the Release `fetch_or`.
+///   happens-before the `COMPLETED|OUTCOME_VALID` bits are set by the Release
+///   `fetch_or`.
 /// - The outcome cell is read only after observing COMPLETED via an
 ///   Acquire-or-stronger load of `state`, which synchronizes-with that
 ///   Release RMW.
+/// - The outcome cell is dropped exactly once: by `reset` (a pooled slot has
+///   no observers) or by `into_outcome`'s take (which clears `OUTCOME_VALID`,
+///   so the slot's final drop skips it).
 /// - The `HAS_WAITER` bit and the `COMPLETED` bit share one word, so the two
 ///   RMWs are totally ordered by the modification order: a waiter that
 ///   completes its registration never parks without either seeing `COMPLETED`
@@ -175,7 +184,9 @@ enum Waiter {
 /// - Reclamation is entirely `Arc`-based; no raw pointer outlives the slot.
 struct Slot<O> {
     state: AtomicUsize,
-    outcome: UnsafeCell<Option<O>>,
+    // O-sized (no Option tag): the OUTCOME_VALID bit in `state` is the
+    // liveness marker, and COMPLETED gates every read.
+    outcome: UnsafeCell<MaybeUninit<O>>,
     // Created lazily on the first waiter: the common case (no waiters ever)
     // keeps the slot 16 bytes smaller and allocation-free, and the hot path
     // never touches this field.
@@ -196,9 +207,9 @@ impl<O> Slot<O> {
     /// the single write happens-before that bit is set (Release RMW), so the
     /// cell holds a valid outcome.
     #[cfg(not(loom))]
-    unsafe fn outcome_ref(&self) -> Option<&O> {
+    unsafe fn outcome_ref(&self) -> &O {
         // SAFETY: gated by the caller via the COMPLETED bit (invariant 2).
-        unsafe { (*self.outcome.get()).as_ref() }
+        unsafe { (*self.outcome.get()).assume_init_ref() }
     }
 
     /// Borrow the outcome cell (loom-checked access).
@@ -207,11 +218,11 @@ impl<O> Slot<O> {
     /// Same gating as the non-loom branch; loom additionally verifies the
     /// access against its scheduling model.
     #[cfg(loom)]
-    unsafe fn outcome_ref(&self) -> Option<&O> {
+    unsafe fn outcome_ref(&self) -> &O {
         self.outcome.with(|ptr| {
             // SAFETY: same gating as the non-loom branch; loom additionally
             // verifies the access against its scheduling model.
-            unsafe { (*ptr).as_ref() }
+            unsafe { (*ptr).assume_init_ref() }
         })
     }
 
@@ -221,8 +232,9 @@ impl<O> Slot<O> {
     /// Called exactly once, before the COMPLETED bit is set.
     #[cfg(not(loom))]
     unsafe fn set_outcome(&self, outcome: O) {
-        // SAFETY: single writer (invariant 1).
-        unsafe { *self.outcome.get() = Some(outcome) };
+        // SAFETY: single writer (invariant 1); the write happens-before the
+        // COMPLETED|OUTCOME_VALID Release RMW.
+        unsafe { (*self.outcome.get()).write(outcome) };
     }
 
     /// Write the outcome cell (loom-checked access).
@@ -233,31 +245,31 @@ impl<O> Slot<O> {
     unsafe fn set_outcome(&self, outcome: O) {
         self.outcome.with_mut(|ptr| {
             // SAFETY: single writer (invariant 1).
-            unsafe { *ptr = Some(outcome) };
+            unsafe { (*ptr).write(outcome) };
         });
     }
 
-    /// Clear the outcome cell.
+    /// Drop the published outcome, if the cell holds one.
     ///
     /// # Safety
     /// No reader can observe the cell (a pooled slot has no observers; the
-    /// write is published by the subsequent Release store of `state`).
+    /// subsequent store of `state` publishes the drop), and the caller
+    /// guarantees `OUTCOME_VALID` is set (so the drop happens exactly once).
     #[cfg(not(loom))]
-    unsafe fn clear_outcome(&self) {
+    unsafe fn drop_outcome(&self) {
         // SAFETY: no concurrent readers (pooled-slot invariant).
-        unsafe { *self.outcome.get() = None };
+        unsafe { (*self.outcome.get()).assume_init_drop() };
     }
 
-    /// Clear the outcome cell (loom-checked access).
+    /// Drop the published outcome (loom-checked access).
     ///
     /// # Safety
-    /// No reader can observe the cell (a pooled slot has no observers; the
-    /// write is published by the subsequent Release store of `state`).
+    /// Same as the non-loom branch.
     #[cfg(loom)]
-    unsafe fn clear_outcome(&self) {
+    unsafe fn drop_outcome(&self) {
         self.outcome.with_mut(|ptr| {
-            // SAFETY: no concurrent readers (pooled-slot invariant).
-            unsafe { *ptr = None };
+            // SAFETY: same as the non-loom branch.
+            unsafe { (*ptr).assume_init_drop() };
         });
     }
 
@@ -270,10 +282,15 @@ impl<O> Slot<O> {
     /// Return a pooled slot to the pristine pending state for reuse by a new
     /// generation.
     fn reset(&self) {
-        // SAFETY: pooled slots have no observers (see `Subject::drop`), so
-        // the cell is unobservable; the Release store publishes the clear.
-        unsafe { self.clear_outcome() };
-        if self.state.load(Ordering::Relaxed) & HAS_WAITER != 0 {
+        let state = self.state.load(Ordering::Relaxed);
+        if state & OUTCOME_VALID != 0 {
+            // SAFETY: pooled slots have no observers (see `Subject::drop`),
+            // so the cell is unobservable; the Release store below publishes
+            // the drop. OUTCOME_VALID is then cleared by the same store, so
+            // the slot's final drop will not double-drop.
+            unsafe { self.drop_outcome() };
+        }
+        if state & HAS_WAITER != 0 {
             // A stale registration can survive (a waker whose caller dropped
             // its observation before completion). Drain it so no dead waiter
             // is retained in the pool or fired across generations. No waiter
@@ -284,6 +301,20 @@ impl<O> Slot<O> {
             }
         }
         self.state.store(0, Ordering::Release);
+    }
+}
+
+impl<O> Drop for Slot<O> {
+    fn drop(&mut self) {
+        // SAFETY: the last Arc reference is being dropped (reclamation is
+        // entirely Arc-based), so no other thread can access the slot.
+        // OUTCOME_VALID is set exactly while the cell holds a live value:
+        // written by complete, cleared by reset's recycle and into_outcome's
+        // take, so the drop fires exactly once.
+        if self.state.load(Ordering::Relaxed) & OUTCOME_VALID != 0 {
+            // SAFETY: see above.
+            unsafe { self.drop_outcome() };
+        }
     }
 }
 
@@ -472,7 +503,7 @@ where
             }
             None => Arc::new(Slot {
                 state: AtomicUsize::new(0),
-                outcome: UnsafeCell::new(None),
+                outcome: UnsafeCell::new(MaybeUninit::uninit()),
                 waiters: OnceLock::new(),
             }),
         };
@@ -533,7 +564,10 @@ where
         // publishes the write to readers that observe COMPLETED.
         unsafe { self.slot.set_outcome(outcome) };
         self.completed = true;
-        let previous = self.slot.state.fetch_or(COMPLETED, Ordering::Release);
+        let previous = self
+            .slot
+            .state
+            .fetch_or(COMPLETED | OUTCOME_VALID, Ordering::Release);
         if previous & HAS_WAITER != 0 {
             let waiters = {
                 let mut waiters = lock(self.slot.waiters());
@@ -583,11 +617,7 @@ impl<O: Clone> Observation<O> {
     pub fn try_get(&self) -> Option<O> {
         if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
             // SAFETY: COMPLETED observed with Acquire (invariant 2).
-            Some(
-                unsafe { self.slot.outcome_ref() }
-                    .expect("completed slot holds an outcome")
-                    .clone(),
-            )
+            Some(unsafe { self.slot.outcome_ref() }.clone())
         } else {
             None
         }
@@ -612,9 +642,7 @@ impl<O: Clone> Observation<O> {
             if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
                 // SAFETY: COMPLETED observed with Acquire (invariant 2), so
                 // the outcome is present.
-                return unsafe { self.slot.outcome_ref() }
-                    .expect("completed slot holds an outcome")
-                    .clone();
+                return unsafe { self.slot.outcome_ref() }.clone();
             }
             self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
             let mut waiters = lock(self.slot.waiters());
@@ -628,9 +656,7 @@ impl<O: Clone> Observation<O> {
                 // stale registration must not survive into a pooled slot.
                 waiters
                     .retain(|waiter| !matches!(waiter, Waiter::Thread(t) if t.id() == thread_id));
-                return unsafe { self.slot.outcome_ref() }
-                    .expect("completed slot holds an outcome")
-                    .clone();
+                return unsafe { self.slot.outcome_ref() }.clone();
             }
             drop(waiters);
             park();
@@ -661,11 +687,7 @@ impl<O: Clone> Observation<O> {
             if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
                 // SAFETY: COMPLETED observed with Acquire (invariant 2), so
                 // the outcome is present.
-                return Some(
-                    unsafe { self.slot.outcome_ref() }
-                        .expect("completed slot holds an outcome")
-                        .clone(),
-                );
+                return Some(unsafe { self.slot.outcome_ref() }.clone());
             }
             self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
             let mut waiters = lock(self.slot.waiters());
@@ -679,11 +701,7 @@ impl<O: Clone> Observation<O> {
                 // a stale registration must not survive into a pooled slot.
                 waiters
                     .retain(|waiter| !matches!(waiter, Waiter::Thread(t) if t.id() == thread_id));
-                return Some(
-                    unsafe { self.slot.outcome_ref() }
-                        .expect("completed slot holds an outcome")
-                        .clone(),
-                );
+                return Some(unsafe { self.slot.outcome_ref() }.clone());
             }
             drop(waiters);
             #[cfg(not(loom))]
@@ -717,10 +735,21 @@ impl<O> Observation<O> {
     #[must_use]
     pub fn into_outcome(self) -> Option<O> {
         let slot = Arc::try_unwrap(self.slot).ok()?;
-        // Exclusive ownership via the move; `into_inner` consumes the cell,
-        // so no access can race it.
+        // Exclusive ownership via the move; no access can race it.
         if slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
-            slot.outcome.into_inner()
+            // SAFETY: COMPLETED observed with Acquire (invariant 2), so the
+            // cell was written before the Release RMW that set it.
+            #[cfg(not(loom))]
+            let outcome = unsafe { slot.outcome.get().read().assume_init() };
+            #[cfg(loom)]
+            let outcome = slot.outcome.with(|ptr| {
+                // SAFETY: same gating as the non-loom branch; loom verifies
+                // the access against its scheduling model.
+                unsafe { (*ptr).assume_init_read() }
+            });
+            // Mark the value taken so the slot's Drop does not double-drop.
+            slot.state.fetch_and(!OUTCOME_VALID, Ordering::Relaxed);
+            Some(outcome)
         } else {
             None
         }
