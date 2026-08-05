@@ -128,6 +128,24 @@ fn pooled_slot_reuse_isolates_generations() {
     });
 }
 
+/// Promotion from the inline vector to the hash map preserves observe and
+/// retire semantics, including reuse after retirement.
+#[test]
+fn small_map_promotion_preserves_semantics() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let mut subjects = Vec::new();
+        for key in 0..5_u64 {
+            subjects.push(space.subject(key).expect("fresh key"));
+        }
+        for key in 0..5_u64 {
+            assert!(space.observe(&key).is_ok());
+        }
+        subjects.clear();
+        assert!(space.subject(0_u64).is_ok());
+    });
+}
+
 /// Two concurrent waiters: the drain wakes both, each with the outcome.
 #[test]
 fn multiple_waiters_all_wake() {

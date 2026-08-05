@@ -97,6 +97,39 @@ Protocol:
   ever registered; slot grows by the separate waiters mutex (retained +~8B).
 - Result: kept. See the final table below.
 
+## EXPERIMENT 8/9 - recycled-slot pool (safe)
+
+- Hypothesis: the 72 B `Arc<Slot>` malloc per op is ~1/3 of the hot path and
+  a shared-allocator contention point at 8 threads. Slots whose retire finds
+  no live observers can be recycled.
+- Key insight: at retire, while holding the entries lock and after removing
+  the entry, no new observer can reference the slot (observe needs both the
+  lock and the entry), so the strong count can only decrease: exactly 1
+  (the subject's own handle) iff no observer holds it. `Arc::strong_count`
+  read under the lock is therefore a sound "no observers" test.
+- EXP8 (superseded): pool behind its own nested `Mutex` - primary flat
+  (the 2 uncontended nested locks ate the malloc gain).
+- EXP9 (kept): pool folded into `Entries { map, pool }` behind the single
+  entries mutex - `&mut` through the guard, zero extra locks. On reuse the
+  slot is reset (outcome cleared + `state.store(0, Release)`); stale
+  COMPLETED/HAS_WAITER bits cannot leak (loom test
+  `pooled_slot_reuse_isolates_generations`). Cap `SLOT_POOL_CAP = 128`
+  bounds retained memory. Auto-trait note: the space now requires
+  `O: Send + Sync` (the pooled `Arc<Slot<O>>` must be `Send`).
+- Result: primary +2.9% (27.9M -> 28.7M); seq scenarios ~44M; contention
+  8t 8.5M -> 11.4M; alloc 0 blocks / 0 bytes per op; retained unchanged
+  (112 B); loom 8/8, Miri 5/5.
+
+## Rejected: per-space observe cache
+
+An `AtomicU64`-keyed cache of the last observed slot could skip the observe
+entries lock, but a cached slot can outlive its generation under rapid
+address reuse (retire+resubject between cache fill and hit), handing an
+observer a retired generation - a generations-crossing hazard that the map
+under the lock cannot produce. Invalidation under the entries lock cannot
+close the race (observe reads the cache outside the lock). Rejected; the
+entries lock stays on the observe path.
+
 ## Experiment results (frozen workload, best-of-5, observations_per_second)
 
 | # | change | primary | vs baseline | decision |
@@ -110,18 +143,21 @@ Protocol:
 | 7 | EXP6: lock-free outcome slot (unsafe: state word + UnsafeCell, waiters mutex) | 27,897,181 | +257% | keep |
 | 8 | EXP7: retire via remove-then-restore (single lookup) | 26,160,291 | +235% | REJECTED (-6%: hashbrown value-returning remove slower than get+conditional remove) |
 | 9 | harness: wait_roundtrip p50/p99 scenario | 27,932,473 | +257% | keep (no lib change) |
+| 10 | EXP8: slot pool, nested pool Mutex | 27,702,717 | +254% | superseded by EXP9 (folded pool, no nested locks) |
+| 11 | EXP9: pool folded into Entries{map,pool} behind one mutex | 28,720,880 | +267% | keep |
 
-Final design: 64-bit-shard-free single `Mutex<HashMap<K, SlotEntry, FxHasher>>`
-key table (parking_lot) + generation counter `AtomicUsize` + lock-free slot
-(single-word state: COMPLETED | HAS_WAITER; `UnsafeCell<Option<O>>`; waiters
-under their own `parking_lot::Mutex<Vec<Thread>>`).
+Final design: single `Mutex<Entries { map: HashMap<K, SlotEntry, FxHasher>,
+pool: Vec<Arc<Slot>> }>` key table (parking_lot) + generation counter
+`AtomicUsize` + lock-free slot (single-word state: COMPLETED | HAS_WAITER;
+`UnsafeCell<Option<O>>`; waiters under their own `parking_lot::Mutex<Vec<Thread>>`)
++ recycled-slot pool (retire-time strong-count proof, cap 128).
 
-Final numbers (run #9): primary 27.93M; seq_observe_first 33.4M,
-seq_complete_first 33.0M, retire_recreate 38.2M, cancel 38.8M;
-fanout(8) 135.7M observations/s; hot path p50/p99 41/42 ns; wait round-trip
-p50/p99 2.7/6.2 us; contention 1t/4t/8t 38.8M/15.0M/8.5M; alloc 72 B / 1
-block per op; retained 112 B / 1 block per subject+observer; after-drop
-residue 1088 B (no leak).
+Final numbers (run #11): primary 28.72M; seq_observe_first 44.0M,
+seq_complete_first 43.8M, retire_recreate 44.2M, cancel 43.3M;
+fanout(8) 133.4M observations/s; hot path p50/p99 41/42 ns; wait round-trip
+p50/p99 2.2/6.6 us; contention 1t/4t/8t 43.7M/19.5M/11.4M; alloc 0 B / 0
+blocks per op (pooled); retained 112 B / 1 block per subject+observer;
+after-drop residue 1088 B (no leak).
 
 ## Actorpass integration contract
 

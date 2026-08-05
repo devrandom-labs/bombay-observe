@@ -4,7 +4,6 @@ use core::hash::{BuildHasherDefault, Hash, Hasher};
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::mem;
 #[cfg(loom)]
 use std::sync::PoisonError;
@@ -217,10 +216,91 @@ struct SlotEntry<O> {
 /// Upper bound on recycled slots retained per space.
 const SLOT_POOL_CAP: usize = 128;
 
+/// Number of inline key entries before promoting to a hash map.
+const INLINE_CAP: usize = 4;
+
+/// Key-table storage: an inline vector of `(key, entry)` pairs for the
+/// common transient case (few live generations at once), promoting to a
+/// hash map at [`INLINE_CAP`] entries so retention-scale workloads stay
+/// O(1). The inline path avoids hashing and probing entirely.
+enum SmallMap<K, O> {
+    Inline(Vec<(K, SlotEntry<O>)>),
+    Hash(HashMap<K, SlotEntry<O>, BuildFx>),
+}
+
+impl<K, O> Default for SmallMap<K, O> {
+    fn default() -> Self {
+        Self::Inline(Vec::new())
+    }
+}
+
+impl<K: Eq + Hash, O> SmallMap<K, O> {
+    fn get(&self, key: &K) -> Option<&SlotEntry<O>> {
+        match self {
+            Self::Inline(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, e)| e),
+            Self::Hash(map) => map.get(key),
+        }
+    }
+
+    /// Whether `key` has no entry.
+    fn is_vacant(&self, key: &K) -> bool {
+        match self {
+            Self::Inline(entries) => !entries.iter().any(|(k, _)| k == key),
+            Self::Hash(map) => !map.contains_key(key),
+        }
+    }
+
+    /// Insert at `key`; the caller guarantees the key is vacant.
+    fn insert_vacant(&mut self, key: K, entry: SlotEntry<O>) {
+        match self {
+            Self::Inline(entries) => {
+                if entries.len() >= INLINE_CAP {
+                    let mut map =
+                        HashMap::with_capacity_and_hasher(entries.len() * 2, BuildFx::default());
+                    map.extend(entries.drain(..));
+                    map.insert(key, entry);
+                    *self = Self::Hash(map);
+                } else {
+                    entries.push((key, entry));
+                }
+            }
+            Self::Hash(map) => {
+                map.insert(key, entry);
+            }
+        }
+    }
+
+    /// Remove the entry at `key` iff it is exactly `generation`.
+    fn remove_if(&mut self, key: &K, generation: usize) -> bool {
+        match self {
+            Self::Inline(entries) => {
+                if let Some(index) = entries.iter().position(|(k, _)| k == key)
+                    && entries[index].1.generation == generation
+                {
+                    entries.swap_remove(index);
+                    return true;
+                }
+                false
+            }
+            Self::Hash(map) => {
+                if map
+                    .get(key)
+                    .is_some_and(|entry| entry.generation == generation)
+                {
+                    map.remove(key);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// The key table plus the recycled-slot pool, guarded by one mutex so the
 /// pool needs no lock of its own (a single `&mut` through the guard).
 struct Entries<K, O> {
-    map: HashMap<K, SlotEntry<O>, BuildFx>,
+    map: SmallMap<K, O>,
     // Recycled slots that no observer can still read, cap-bounded so
     // retention stays explicitly bounded. A pooled slot's strong count is
     // exactly the pool's own reference (see `Subject::drop`).
@@ -263,7 +343,7 @@ impl<K, O> ObservationSpace<K, O> {
             inner: Arc::new(Inner {
                 next_generation: AtomicUsize::new(1),
                 entries: Mutex::new(Entries {
-                    map: HashMap::with_hasher(BuildFx::default()),
+                    map: SmallMap::default(),
                     pool: Vec::new(),
                 }),
             }),
@@ -293,41 +373,40 @@ where
     pub fn subject(&self, key: K) -> Result<Subject<K, O>, SubjectExists<K>> {
         let mut entries = lock(&self.inner.entries);
         let pooled = entries.pool.pop();
-        match entries.map.entry(key.clone()) {
-            Entry::Occupied(_) => {
-                // Restore the unused pooled slot.
-                if let Some(slot) = pooled {
-                    entries.pool.push(slot);
-                }
-                Err(SubjectExists(key))
+        if !entries.map.is_vacant(&key) {
+            // Restore the unused pooled slot.
+            if let Some(slot) = pooled {
+                entries.pool.push(slot);
             }
-            Entry::Vacant(vacant) => {
-                let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
-                assert_ne!(generation, usize::MAX, "observation generation exhausted");
-                let slot = match pooled {
-                    Some(slot) => {
-                        slot.reset();
-                        slot
-                    }
-                    None => Arc::new(Slot {
-                        state: AtomicUsize::new(0),
-                        outcome: UnsafeCell::new(None),
-                        waiters: Mutex::new(Vec::new()),
-                    }),
-                };
-                vacant.insert(SlotEntry {
-                    generation,
-                    slot: slot.clone(),
-                });
-                Ok(Subject {
-                    inner: self.inner.clone(),
-                    key,
-                    generation,
-                    slot,
-                    completed: false,
-                })
-            }
+            return Err(SubjectExists(key));
         }
+        let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(generation, usize::MAX, "observation generation exhausted");
+        let slot = match pooled {
+            Some(slot) => {
+                slot.reset();
+                slot
+            }
+            None => Arc::new(Slot {
+                state: AtomicUsize::new(0),
+                outcome: UnsafeCell::new(None),
+                waiters: Mutex::new(Vec::new()),
+            }),
+        };
+        entries.map.insert_vacant(
+            key.clone(),
+            SlotEntry {
+                generation,
+                slot: slot.clone(),
+            },
+        );
+        Ok(Subject {
+            inner: self.inner.clone(),
+            key,
+            generation,
+            slot,
+            completed: false,
+        })
     }
 
     /// Observe the current generation, including an already completed one.
@@ -390,12 +469,7 @@ where
 {
     fn drop(&mut self) {
         let mut entries = lock(&self.inner.entries);
-        if entries
-            .map
-            .get(&self.key)
-            .is_some_and(|entry| entry.generation == self.generation)
-        {
-            entries.map.remove(&self.key);
+        if entries.map.remove_if(&self.key, self.generation) {
             // With the entry gone and the entries lock held, no new observer
             // can reference this slot (`observe` needs both), so the strong
             // count can only decrease from here: it is exactly 1 (our own
