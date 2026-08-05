@@ -230,6 +230,58 @@ heap keys is the `key.clone()` into the map entry (inherent: both the entry
 and the Subject own the key; free for the `u64` keys of the frozen
 workload).
 
+## EXPERIMENT 14 - lazy waiters (kept, measured)
+
+Hypothesis (memory-efficiency axis): every slot carries a 32B inline
+`Mutex<Vec<Waiter>>` even when no waiter ever registers, and the hot path
+never touches the waiters field. Replaced with `OnceLock<Arc<Mutex<Vec<Waiter>>>>`
+(16B inline; 40B heap only on the first waiter registration). All wait-path
+call sites route through a `get_or_init` accessor; complete/reset drains
+check `get()` (always `Some` when `HAS_WAITER` is set). Measured: retained
+112->96B per subject+observer (-14%); alloc stays 0/op; primary perf-neutral
+(54.4M, within the AC range). Pure memory win: the field is off the hot path
+entirely.
+
+## EXPERIMENT 15 - outcome cell, MaybeUninit + OUTCOME_VALID bit (kept, measured)
+
+Hypothesis (memory-efficiency axis): the outcome cell `UnsafeCell<Option<O>>`
+(16B for the u64 harness) carries a redundant Option tag - `COMPLETED`
+already gates every read, and `into_outcome` takes the value only at the
+last reference (`Arc::try_unwrap`), so a "taken" state is never observed by
+another reader. The tag moved into the state word as an `OUTCOME_VALID` bit
+(1<<2), set by complete's RMW (`fetch_or(COMPLETED | OUTCOME_VALID, Release)`)
+and cleared by reset's recycle and into_outcome's take. Readers keep the
+single `state & COMPLETED` AND-compare (identical instruction count). The
+cell is `UnsafeCell<MaybeUninit<O>>` (8B): written once by complete
+(`MaybeUninit::write`, happens-before the Release RMW), read only after
+COMPLETED is observed (Acquire), dropped exactly once (reset's
+`assume_init_drop` under the entries write lock, or into_outcome's
+`assume_init_read` + bit clear, or the slot's manual `Drop` gated on the
+bit - the pool's retired slots and taken cells have the bit clear, so the
+final drop is a no-op there).
+
+New unsafe invariants (replace EXPERIMENT 6's "Option cell"):
+1. The outcome cell is written exactly once, by complete, before the
+   `COMPLETED|OUTCOME_VALID` Release `fetch_or`.
+2. The outcome cell is read only after observing `COMPLETED` via an
+   Acquire-or-stronger load of `state`, which synchronizes-with that
+   Release RMW.
+3. The outcome cell is dropped exactly once: reset (pooled slot, no
+   observers, under the entries write lock; the subsequent Release store of
+   `state` publishes the drop), into_outcome (last reference via
+   `Arc::try_unwrap`, `assume_init_read` then `fetch_and(!OUTCOME_VALID)`),
+   or the slot's final `Drop` (last Arc reference; gated on `OUTCOME_VALID`).
+   `OUTCOME_VALID` is the single source of truth for whether the cell holds
+   a live value.
+
+Measured: slot 56->48B (72->64B with the Arc header); retained 96->88B
+(-8%); alloc stays 0/op; primary 52.3M (within the AC range); contention
+slightly improves (8t 11.4M vs 10.8M, 16t 13.0M vs 12.6M) - the smaller
+slot packs better into cache lines. Verification: std 15/15, loom 11/11 at
+preemptions 3 and 7 (models exercise the outcome read, into_outcome racing
+complete, and the wait path), Miri 15/15 (including the into_outcome
+move-out under the real-thread model), clippy clean, gate CHECK OK.
+
 ## EXPERIMENT 13 - entries RwLock (kept, measured)
 
 Hypothesis (correcting an earlier analytical dismissal): the observe read (1
@@ -407,9 +459,12 @@ battery - a 1.44x ratio confirming the power-governor depression).
   allocation per subject became the dominant cost (it is ~1/3 of the op now).
 - Sharded key table (EXP5): measured -27% (see table).
 - remove-then-restore retire (EXP7): measured -6% (see table).
-- RwLock entries map: not tried; writes are 2/3 of map ops, so reader
-  parallelism is capped; uncontended parking_lot RwLock reads cost about the
-  same as its Mutex. Low expected value.
+- RwLock entries map: initially dismissed analytically (writes are 2/3 of
+  map ops, so reader parallelism is capped); MEASURED anyway in EXP13 and
+  KEPT - the observe read (1 of 3 acquisitions per op) parallelizes under an
+  RwLock and contention improves +10-20% with a neutral primary. The lesson
+  (handoff latency, not instruction count, dominates under contention) drove
+  the EXP14/EXP15 re-audits of analytically-dismissed memory items.
 - dhat for allocation accounting: 0.3 dropped the programmatic stats API;
   hand-rolled counting GlobalAlloc used instead (documented invariants).
 
