@@ -71,9 +71,13 @@ use loom::sync::Arc;
 #[cfg(loom)]
 use loom::sync::Mutex;
 #[cfg(loom)]
+use loom::sync::RwLock;
+#[cfg(loom)]
 use loom::thread::{Thread, current, park};
 #[cfg(not(loom))]
 use parking_lot::Mutex;
+#[cfg(not(loom))]
+use parking_lot::RwLock;
 #[cfg(not(loom))]
 use std::cell::UnsafeCell;
 #[cfg(not(loom))]
@@ -90,9 +94,31 @@ fn lock<T>(mutex: &loom::sync::Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(recover)
 }
 
+#[cfg(loom)]
+fn read_lock<T>(lock: &loom::sync::RwLock<T>) -> loom::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(recover)
+}
+
+#[cfg(loom)]
+fn write_lock<T>(lock: &loom::sync::RwLock<T>) -> loom::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(recover)
+}
+
 #[cfg(not(loom))]
 fn lock<T>(mutex: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
     mutex.lock()
+}
+
+/// Acquire the entries lock for reading (observe).
+#[cfg(not(loom))]
+fn read_lock<T>(lock: &parking_lot::RwLock<T>) -> parking_lot::RwLockReadGuard<'_, T> {
+    lock.read()
+}
+
+/// Acquire the entries lock for writing (subject/retire).
+#[cfg(not(loom))]
+fn write_lock<T>(lock: &parking_lot::RwLock<T>) -> parking_lot::RwLockWriteGuard<'_, T> {
+    lock.write()
 }
 
 #[cfg(loom)]
@@ -356,7 +382,7 @@ struct Inner<K, O> {
     // is only compared under the `entries` mutex, whose acquire/release
     // orders the entry's publication. Relaxed is therefore sufficient.
     next_generation: AtomicUsize,
-    entries: Mutex<Entries<K, O>>,
+    entries: RwLock<Entries<K, O>>,
 }
 
 /// Shared completion namespace.
@@ -385,7 +411,7 @@ impl<K, O> ObservationSpace<K, O> {
         Self {
             inner: Arc::new(Inner {
                 next_generation: AtomicUsize::new(1),
-                entries: Mutex::new(Entries {
+                entries: RwLock::new(Entries {
                     map: SmallMap::default(),
                     pool: Vec::new(),
                 }),
@@ -416,7 +442,7 @@ where
     /// # Panics
     /// Panics if the process exhausts all generations.
     pub fn subject(&self, key: K) -> Result<Subject<K, O>, SubjectExists<K>> {
-        let mut entries = lock(&self.inner.entries);
+        let mut entries = write_lock(&self.inner.entries);
         let pooled = entries.pool.pop();
         if !entries.map.is_vacant(&key) {
             // Restore the unused pooled slot.
@@ -459,7 +485,7 @@ where
     /// # Errors
     /// Returns [`UnknownSubject`] when no generation is currently retained.
     pub fn observe(&self, key: &K) -> Result<Observation<O>, UnknownSubject<K>> {
-        let entries = lock(&self.inner.entries);
+        let entries = read_lock(&self.inner.entries);
         let slot = entries
             .map
             .get(key)
@@ -516,7 +542,7 @@ where
     K: Eq + Hash,
 {
     fn drop(&mut self) {
-        let mut entries = lock(&self.inner.entries);
+        let mut entries = write_lock(&self.inner.entries);
         if entries.map.remove_if(&self.key, self.generation) {
             // With the entry gone and the entries lock held, no new observer
             // can reference this slot (`observe` needs both), so the strong
