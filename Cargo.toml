@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/observepass", "crates/observepass-perf"]
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+[workspace.dependencies]
+observepass = { path = "crates/observepass" }
+criterion = "0.8"
+loom = "0.7"
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
