@@ -27,7 +27,9 @@ fn main() {
     fanout();
     latency();
     wait_latency();
-    for threads in [1_usize, 4, 8] {
+    // Scaling: 1/2/4/8/16 threads (16 oversubscribes the machine's 12
+    // physical cores, exposing scheduling degradation).
+    for threads in [1_usize, 2, 4, 8, 16] {
         contention(threads);
     }
 }
