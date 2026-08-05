@@ -192,3 +192,19 @@ fn into_outcome_racing_complete() {
         assert!(result.is_none() || result == Some(Handle(9)));
     });
 }
+
+/// The wait_timeout registration protocol matches wait() under the model
+/// (the clock is not modeled; the completion path is what matters).
+#[test]
+fn wait_timeout_wakes_with_outcome() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let mut subject = space.subject(7_u64).unwrap();
+        let observation = space.observe(&7_u64).unwrap();
+        let observer =
+            thread::spawn(move || observation.wait_timeout(std::time::Duration::from_secs(1)));
+        yield_now();
+        subject.complete(9_u64);
+        assert_eq!(observer.join().unwrap(), Some(9_u64));
+    });
+}

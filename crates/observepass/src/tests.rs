@@ -5,6 +5,7 @@
 //! at the OS level.
 
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use crate::ObservationSpace;
 
@@ -144,4 +145,34 @@ fn register_waker_after_completion_returns_true() {
     subject.complete(3_u64);
     let observation = space.observe(&7_u64).unwrap();
     assert!(observation.register_waker(std::task::Waker::noop()));
+}
+
+/// A pending subject times out without returning a fabricated outcome.
+#[test]
+fn wait_timeout_returns_none_when_pending() {
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    let started = Instant::now();
+    assert_eq!(observation.wait_timeout(Duration::from_millis(10)), None);
+    assert!(started.elapsed() >= Duration::from_millis(9));
+    subject.complete(9_u64);
+    assert_eq!(observation.try_get(), Some(9_u64));
+}
+
+/// A completion during the wait is delivered before the deadline.
+#[test]
+fn wait_timeout_returns_outcome_when_completed() {
+    let space = ObservationSpace::new();
+    let mut subject = space.subject(7_u64).unwrap();
+    let observation = space.observe(&7_u64).unwrap();
+    let completer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        subject.complete(9_u64);
+    });
+    assert_eq!(
+        observation.wait_timeout(Duration::from_secs(5)),
+        Some(9_u64)
+    );
+    completer.join().unwrap();
 }

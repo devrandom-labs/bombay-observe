@@ -74,7 +74,8 @@ use std::cell::UnsafeCell;
 #[cfg(not(loom))]
 use std::sync::Arc;
 #[cfg(not(loom))]
-use std::thread::{Thread, current, park};
+use std::thread::{Thread, current, park, park_timeout};
+use std::time::{Duration, Instant};
 
 /// Acquire a mutex, unwrapping poisoning. std's `Mutex` poisons (and, on
 /// macOS, lazily heap-allocates its pthread mutex on first lock);
@@ -93,6 +94,26 @@ fn lock<T>(mutex: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
 #[cfg(loom)]
 fn recover<T>(error: PoisonError<T>) -> T {
     error.into_inner()
+}
+
+/// Park until woken or the deadline passes; returns whether the deadline has
+/// not yet passed. Under loom, park without a timeout (the model has no
+/// clock, and the registration protocol is what matters).
+#[cfg(not(loom))]
+fn park_until(deadline: Instant) -> bool {
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    park_timeout(deadline - now);
+    true
+}
+
+/// Park until woken (loom variant; no clock).
+#[cfg(loom)]
+fn park_until() -> bool {
+    park();
+    true
 }
 
 /// Completion-state bits for [`Slot`].
@@ -555,6 +576,58 @@ impl<O: Clone> Observation<O> {
             }
             drop(waiters);
             park();
+        }
+    }
+
+    /// Block the current thread until completion or `timeout` elapses.
+    ///
+    /// Returns `None` when the timeout elapses before the outcome is
+    /// published. A completion that races the deadline is still observed:
+    /// the loop re-checks after every wake, before the deadline test. A
+    /// timed-out waiter remains registered; a later completion only produces
+    /// a spurious wake.
+    ///
+    /// # Panics
+    /// Panics only if the completed-bit protocol is violated (a programmer
+    /// a bug); a slot that reports completion always holds an outcome.
+    #[must_use]
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<O> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("wait timeout overflows Instant");
+        loop {
+            if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
+                // SAFETY: COMPLETED observed with Acquire (invariant 2), so
+                // the outcome is present.
+                return Some(
+                    unsafe { self.slot.outcome_ref() }
+                        .expect("completed slot holds an outcome")
+                        .clone(),
+                );
+            }
+            self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
+            let mut waiters = lock(&self.slot.waiters);
+            waiters.push(Waiter::Thread(current()));
+            if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
+                // SAFETY: COMPLETED observed with SeqCst (invariant 2), so
+                // the outcome is present.
+                return Some(
+                    unsafe { self.slot.outcome_ref() }
+                        .expect("completed slot holds an outcome")
+                        .clone(),
+                );
+            }
+            drop(waiters);
+            #[cfg(not(loom))]
+            {
+                if !park_until(deadline) {
+                    return None;
+                }
+            }
+            #[cfg(loom)]
+            {
+                park_until();
+            }
         }
     }
 }

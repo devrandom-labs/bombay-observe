@@ -157,6 +157,17 @@ contract without changing the hot path:
 Primary unchanged (49.6M). std 9/9, loom 10/10 (into_outcome racing
 complete never torn), Miri 9/9, gate green.
 
+## Adapter example (deliverable, perf-neutral)
+
+`crates/observepass/examples/actorpass_adapter.rs` is executable proof of the
+integration contract: one generation per `Subject` at a key,
+`register_waker` before task completion (std `Waker`, no Tokio; the returned
+flag closes the registration-races-completion race), `complete` exactly once,
+an executor loop reading via `try_get`, peer observation after completion,
+and the adapter's `ChildStopped`/`PeerStopped` translation in its own
+vocabulary (observepass itself knows none of it). Runs clean, clippy 0, gate
+green. Primary unchanged (49.9M).
+
 ## Rejected: per-space observe cache
 
 An `AtomicU64`-keyed cache of the last observed slot could skip the observe
