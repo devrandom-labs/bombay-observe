@@ -108,3 +108,32 @@ fn late_observer_reads_retained_outcome() {
         assert_eq!(observation.try_get(), Some(5_u64));
     });
 }
+
+/// Two concurrent waiters: the drain wakes both, each with the outcome.
+#[test]
+fn multiple_waiters_all_wake() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let mut subject = space.subject(7_u64).unwrap();
+        let first = space.observe(&7_u64).unwrap();
+        let second = space.observe(&7_u64).unwrap();
+        let first_waiter = thread::spawn(move || first.wait());
+        let second_waiter = thread::spawn(move || second.wait());
+        yield_now();
+        subject.complete(9_u64);
+        assert_eq!(first_waiter.join().unwrap(), 9_u64);
+        assert_eq!(second_waiter.join().unwrap(), 9_u64);
+    });
+}
+
+/// A waiter that registers after completion returns without parking.
+#[test]
+fn waiter_after_completion_returns_immediately() {
+    loom::model(|| {
+        let space: ObservationSpace<u64, u64> = ObservationSpace::new();
+        let mut subject = space.subject(7_u64).unwrap();
+        subject.complete(4_u64);
+        let observation = space.observe(&7_u64).unwrap();
+        assert_eq!(observation.wait(), 4_u64);
+    });
+}

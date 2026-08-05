@@ -47,3 +47,52 @@ a correctness baseline, not a preferred design.
   (subject/observe/retire races).
 - Result: see benchmark table below.
 
+## EXPERIMENT 6 — lock-free outcome slot (unsafe, tokio-oneshot derived)
+
+Context: with parking_lot (EXP4), per-op cost is dominated by the two slot
+locks (`complete`, `try_get`). EXP5 (64-shard table) regressed and was
+discarded. Design derives from tokio `oneshot` (`AtomicUsize` state +
+`UnsafeCell` value + single waiter slot) extended with a waiters Vec.
+
+Slot layout:
+
+```text
+state:   AtomicUsize   bit0 = COMPLETED, bit1 = HAS_WAITER (one word, RMW-total-ordered)
+outcome: UnsafeCell<Option<O>>
+waiters: Mutex<Vec<Thread>>   (registration + drain only)
+```
+
+Protocol:
+- complete: write outcome; `fetch_or(COMPLETED, Release)`; if the RMW read
+  HAS_WAITER, drain waiters under the mutex and unpark all outside it.
+- try_get: `state.load(Acquire)`; if COMPLETED, clone the outcome.
+- wait: load state; if COMPLETED return; `fetch_or(HAS_WAITER, SeqCst)`;
+  lock waiters, push, reload state (SeqCst) — if COMPLETED return; unlock;
+  park; repeat.
+
+### Unsafe invariants (proof obligations)
+1. The outcome cell is written exactly once (Subject::complete is
+   single-call; `completed` flag asserts) and the write happens-before the
+   COMPLETED bit is set (program order + the Release RMW).
+2. The outcome cell is read only after observing COMPLETED via an
+   Acquire-or-stronger load of `state` (try_get, wait's pre-park and
+   post-push rechecks), which synchronizes-with the Release RMW. No reader
+   can observe the bit before the write, so no torn/empty reads.
+3. No lost wakeup: waiter's `fetch_or(HAS_WAITER, SeqCst)` and complete's
+   `fetch_or(COMPLETED, Release)` are RMWs on one location, totally ordered
+   by the modification order. If complete's RMW runs first and reads no
+   HAS_WAITER, the waiter's later SeqCst state load (after its own RMW in
+   program order) reads COMPLETED by coherence and returns without parking.
+   If the waiter's RMW runs first, complete sees HAS_WAITER and drains; the
+   waiters mutex serializes drain vs push, and park consumes the token
+   (std token semantics: unpark-before-park returns immediately).
+4. Reclamation: no raw pointer outlives the Arc<Slot>; `UnsafeCell` is
+   dropped with the Arc. No epoch/hazard-pointer burden.
+5. Cancellation: dropping an Observation never touches the slot; a parked
+   waiter's stale registration only produces a spurious token.
+- Loom models the real implementation (`loom::cell::UnsafeCell`,
+  `loom::sync::atomic`, `loom::sync::Mutex`, `loom::thread::{park,current}`),
+  including the wait path. Miri runs the real-thread unit tests.
+- Expected: `try_get` lock-free and `complete` lock-free when no waiter has
+  ever registered; slot grows by the separate waiters mutex (retained +~8B).
+

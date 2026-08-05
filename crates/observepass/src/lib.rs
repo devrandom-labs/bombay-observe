@@ -1,11 +1,14 @@
 //! Generation-safe completion publication and observation.
 
 use core::hash::{BuildHasherDefault, Hash, Hasher};
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::mem;
 #[cfg(loom)]
 use std::sync::PoisonError;
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fixed-seed 64-bit multiply-xor-rotate hasher (rustc's `FxHash`, as in the
@@ -57,6 +60,8 @@ impl Hasher for FxHasher {
 type BuildFx = BuildHasherDefault<FxHasher>;
 
 #[cfg(loom)]
+use loom::cell::UnsafeCell;
+#[cfg(loom)]
 use loom::sync::Arc;
 #[cfg(loom)]
 use loom::sync::Mutex;
@@ -64,6 +69,8 @@ use loom::sync::Mutex;
 use loom::thread::{Thread, current, park};
 #[cfg(not(loom))]
 use parking_lot::Mutex;
+#[cfg(not(loom))]
+use std::cell::UnsafeCell;
 #[cfg(not(loom))]
 use std::sync::Arc;
 #[cfg(not(loom))]
@@ -88,21 +95,85 @@ fn recover<T>(error: PoisonError<T>) -> T {
     error.into_inner()
 }
 
-/// Per-subject completion cell: the outcome plus every thread blocked in
-/// [`Observation::wait`] on this generation.
+/// Completion-state bits for [`Slot`].
+const COMPLETED: usize = 1 << 0;
+const HAS_WAITER: usize = 1 << 1;
+
+/// Per-subject completion cell: a lock-free outcome publication point plus a
+/// mutex-protected waiter registry.
 ///
-/// Registration and publication happen under the same mutex, so they cannot
-/// interleave. A waiter registered before completion is guaranteed to wake:
-/// `unpark` makes the thread's token available, and `park` consumes an
-/// already-available token without blocking (std token semantics). Waiters
-/// are drained and unparked after releasing the lock.
+/// The full safety argument is recorded in `docs/research-log.md`
+/// (EXPERIMENT 6). Summary of the invariants:
+/// - The outcome cell is written exactly once, by `complete`, and the write
+///   happens-before the COMPLETED bit is set by the Release `fetch_or`.
+/// - The outcome cell is read only after observing COMPLETED via an
+///   Acquire-or-stronger load of `state`, which synchronizes-with that
+///   Release RMW.
+/// - The `HAS_WAITER` bit and the `COMPLETED` bit share one word, so the two
+///   RMWs are totally ordered by the modification order: a waiter that
+///   completes its registration never parks without either seeing `COMPLETED`
+///   on its post-push recheck or receiving an unpark token from the drain.
+/// - Reclamation is entirely `Arc`-based; no raw pointer outlives the slot.
 struct Slot<O> {
-    state: Mutex<SlotState<O>>,
+    state: AtomicUsize,
+    outcome: UnsafeCell<Option<O>>,
+    waiters: Mutex<Vec<Thread>>,
 }
 
-struct SlotState<O> {
-    outcome: Option<O>,
-    waiters: Vec<Thread>,
+// SAFETY: the outcome cell is written exactly once, before the COMPLETED bit
+// is published by the Release RMW, and read only after COMPLETED is observed
+// (Acquire or stronger); while shared it is immutable. `O: Send + Sync`
+// bounds the shared access to the stored value and its clones.
+unsafe impl<O: Send + Sync> Sync for Slot<O> {}
+
+impl<O> Slot<O> {
+    /// Borrow the outcome cell.
+    ///
+    /// # Safety
+    /// The caller must have observed the COMPLETED bit (Acquire or stronger);
+    /// the single write happens-before that bit is set (Release RMW), so the
+    /// cell holds a valid outcome.
+    #[cfg(not(loom))]
+    unsafe fn outcome_ref(&self) -> Option<&O> {
+        // SAFETY: gated by the caller via the COMPLETED bit (invariant 2).
+        unsafe { (*self.outcome.get()).as_ref() }
+    }
+
+    /// Borrow the outcome cell (loom-checked access).
+    ///
+    /// # Safety
+    /// Same gating as the non-loom branch; loom additionally verifies the
+    /// access against its scheduling model.
+    #[cfg(loom)]
+    unsafe fn outcome_ref(&self) -> Option<&O> {
+        self.outcome.with(|ptr| {
+            // SAFETY: same gating as the non-loom branch; loom additionally
+            // verifies the access against its scheduling model.
+            unsafe { (*ptr).as_ref() }
+        })
+    }
+
+    /// Write the outcome cell.
+    ///
+    /// # Safety
+    /// Called exactly once, before the COMPLETED bit is set.
+    #[cfg(not(loom))]
+    unsafe fn set_outcome(&self, outcome: O) {
+        // SAFETY: single writer (invariant 1).
+        unsafe { *self.outcome.get() = Some(outcome) };
+    }
+
+    /// Write the outcome cell (loom-checked access).
+    ///
+    /// # Safety
+    /// Called exactly once, before the COMPLETED bit is set.
+    #[cfg(loom)]
+    unsafe fn set_outcome(&self, outcome: O) {
+        self.outcome.with_mut(|ptr| {
+            // SAFETY: single writer (invariant 1).
+            unsafe { *ptr = Some(outcome) };
+        });
+    }
 }
 
 struct SlotEntry<O> {
@@ -178,10 +249,9 @@ where
                 let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
                 assert_ne!(generation, usize::MAX, "observation generation exhausted");
                 let slot = Arc::new(Slot {
-                    state: Mutex::new(SlotState {
-                        outcome: None,
-                        waiters: Vec::new(),
-                    }),
+                    state: AtomicUsize::new(0),
+                    outcome: UnsafeCell::new(None),
+                    waiters: Mutex::new(Vec::new()),
                 });
                 vacant.insert(SlotEntry {
                     generation,
@@ -234,13 +304,19 @@ where
     /// Panics when the same subject publishes completion more than once.
     pub fn complete(&mut self, outcome: O) {
         assert!(!self.completed, "subject completed twice");
-        let mut state = lock(&self.slot.state);
-        state.outcome = Some(outcome);
+        // SAFETY: single writer (invariant 1); the Release RMW below
+        // publishes the write to readers that observe COMPLETED.
+        unsafe { self.slot.set_outcome(outcome) };
         self.completed = true;
-        let waiters = mem::take(&mut state.waiters);
-        drop(state);
-        for waiter in waiters {
-            waiter.unpark();
+        let previous = self.slot.state.fetch_or(COMPLETED, Ordering::Release);
+        if previous & HAS_WAITER != 0 {
+            let waiters = {
+                let mut waiters = lock(&self.slot.waiters);
+                mem::take(&mut *waiters)
+            };
+            for waiter in waiters {
+                waiter.unpark();
+            }
         }
     }
 }
@@ -267,31 +343,61 @@ pub struct Observation<O> {
 
 impl<O: Clone> Observation<O> {
     /// Return the outcome without blocking when already complete.
+    ///
+    /// # Panics
+    /// Panics only if the completed-bit protocol is violated (a programmer
+    /// bug); a slot that reports completion always holds an outcome.
     #[must_use]
     pub fn try_get(&self) -> Option<O> {
-        lock(&self.slot.state).outcome.clone()
+        if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
+            // SAFETY: COMPLETED observed with Acquire (invariant 2).
+            Some(
+                unsafe { self.slot.outcome_ref() }
+                    .expect("completed slot holds an outcome")
+                    .clone(),
+            )
+        } else {
+            None
+        }
     }
 
     /// Block the current thread until completion.
     ///
-    /// The waiter registers its thread handle under the slot mutex, re-checks
-    /// the outcome, and only then parks. A completion that raced the
-    /// registration either publishes before the re-check (seen without
-    /// parking) or drains the registration and sets the unpark token (the
-    /// park then returns immediately). Nothing that could itself park runs
-    /// between registration and [`park`], so the token cannot be consumed
-    /// elsewhere.
+    /// The waiter registers under the waiters mutex, re-checks completion,
+    /// and only then parks. A completion that raced the registration either
+    /// publishes before the post-push recheck (seen without parking) or sees
+    /// the `HAS_WAITER` bit and drains the registration, so the park consumes
+    /// the unpark token and returns immediately. Nothing that could itself
+    /// park runs between registration and [`park`], so the token cannot be
+    /// consumed elsewhere.
+    ///
+    /// # Panics
+    /// Panics only if the completed-bit protocol is violated (a programmer
+    /// bug); a slot that reports completion always holds an outcome.
     #[must_use]
     pub fn wait(&self) -> O {
-        let mut state = lock(&self.slot.state);
         loop {
-            if let Some(outcome) = state.outcome.clone() {
-                return outcome;
+            if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
+                // SAFETY: COMPLETED observed with Acquire (invariant 2), so
+                // the outcome is present.
+                return unsafe { self.slot.outcome_ref() }
+                    .expect("completed slot holds an outcome")
+                    .clone();
             }
-            state.waiters.push(current());
-            drop(state);
+            self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
+            let mut waiters = lock(&self.slot.waiters);
+            waiters.push(current());
+            if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
+                // SAFETY: COMPLETED observed with SeqCst (invariant 2), so the
+                // outcome is present. We may still be registered; a later
+                // drain only produces a spurious token, consumed by our next
+                // park.
+                return unsafe { self.slot.outcome_ref() }
+                    .expect("completed slot holds an outcome")
+                    .clone();
+            }
+            drop(waiters);
             park();
-            state = lock(&self.slot.state);
         }
     }
 }
