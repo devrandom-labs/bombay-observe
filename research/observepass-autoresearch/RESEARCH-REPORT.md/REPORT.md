@@ -496,3 +496,20 @@ Affected version under test: workspace commit baseline `cd35234`
   Full suite at bound 8: all 8 models COMPLETE (no truncation), PASS in
   1302.5s release (the promotion-boundary model dominates at ~943s).
   Result: PASS (1 loom model; 8 total).
+- Batch 21: exhaustive waker-drain histories deepened to depth 7 (6^7 =
+  279,936 sequences, full space, ~0.25s — no sampling), a
+  `same_waker_registered_twice_fires_once` test (the will_wake dedup path:
+  two observations of one generation share the slot registry; the shared
+  waker fires exactly once; 50 rounds), and a
+  `register_waker_true_then_into_outcome_takes` contract test (a
+  true-return registration never blocks the later exclusive take; 50
+  rounds). PASS (score 177).
+- Batch 22 (depth, no score change): ASan builds of `promotion_ops` and
+  `waker_ops` (build-std via rust-src): 3,000,000 executions each (66s /
+  72s) — NO CRASH, no sanitizer report (ASan total now 12.25M across
+  three targets). `PROPTEST_CASES=1000000` on all three properties:
+  3/3 PASS in 50.3s release (churn drop-accounting property included).
+  Full re-read of the slot unsafe protocol (`outcome_ref`/`set_outcome`/
+  `drop_outcome` COMPLETED/OUTCOME_VALID gating, the CAS-init waiters
+  registry with loser-reclaim, Arc-based reclamation) — matches the
+  documented invariants; no new seam. Result: PASS (depth-only).
