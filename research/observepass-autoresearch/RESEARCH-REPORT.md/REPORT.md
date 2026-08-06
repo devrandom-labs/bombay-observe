@@ -185,10 +185,22 @@ Affected version under test: workspace commit baseline `cd35234`
   pool/drop-count tests PASS under Miri 0.1.0 (nightly 2026-08-04),
   27.3s interpreted. No UB in the UnsafeCell outcome protocol, raw
   waiters-pointer reclamation, Arc-based slot recycling, or
-  `into_outcome` move. `--test future_cancel`: PASS. `--test exhaustive`:
-  one test reported FAILED after 2,947.94s interpreted (5 passed, 1
-  failed); the failing test and error are being isolated — see follow-up
-  log entries.
+  `into_outcome` move. `--test future_cancel`: PASS. `--test exhaustive`
+  first run: `exhaustive_future_poll_cancel_orders` FAILED under Miri
+  only (`waker fired != once`, 2 vs 1 at polls=2; 2,947.94s interpreted).
+  Root cause: the std `Wake`-derived vtable is a const-promoted temporary
+  whose address differs between code sites under Miri, making
+  `will_wake` spuriously false — the exact artifact the production suite
+  documents in `register_waker_is_idempotent_per_task`. NOT a product
+  defect: the test passes under native execution, and the production
+  crate documents the same workaround. Resolution: `CountWake` in
+  `src/probe.rs` now uses a hand-rolled `RawWaker` with a single static
+  vtable (identical behavior natively, Miri-reliable `will_wake`);
+  targeted Miri rerun of the failing test: PASS. Full-suite Miri
+  confirmation and `panic_safety`/`contract` Miri runs: see follow-up
+  entries. `model` (proptest) and `stress` (1,600+ spawned threads) are
+  excluded from Miri as impractically slow under interpretation — stated
+  honestly, not skipped silently.
 - Batch 8 (coverage-guided fuzzing): cargo-fuzz 0.13.2 (nixpkgs) +
   libfuzzer-sys 0.4.13, `--sanitizer none`, nightly 2026-07-29 toolchain.
   Two targets under `fuzz/fuzz_targets/`: `ops` (sequential op

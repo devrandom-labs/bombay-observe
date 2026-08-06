@@ -5,7 +5,7 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Wake;
+use std::task::{RawWaker, RawWakerVTable, Waker};
 
 /// An outcome whose destruction is observable. `Clone` clones share the
 /// same drop counter; every clone's drop increments it exactly once.
@@ -46,30 +46,71 @@ impl Drop for DropProbe {
 
 /// A waker that counts every `wake`/`wake_by_ref`, for asserting exact
 /// notification counts across cancellation and completion.
+///
+/// Hand-rolled `RawWaker` with a single static vtable: the std
+/// `Wake`-derived vtable is a const-promoted temporary whose address
+/// differs between code sites under Miri, which makes `will_wake`
+/// spuriously false there (the production suite documents the same
+/// workaround). One static vtable keeps `will_wake` reliable under Miri
+/// and identical in behavior to the std derive everywhere else.
 #[derive(Debug, Default)]
 pub struct CountWake {
     wakes: AtomicUsize,
 }
 
+static COUNT_WAKE_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    count_wake_clone,
+    count_wake_wake,
+    count_wake_wake_by_ref,
+    count_wake_drop,
+);
+
+unsafe fn count_wake_clone(data: *const ()) -> RawWaker {
+    // SAFETY: `data` is a live `Arc<CountWake>` pointer owned by the waker
+    // being cloned; the ManuallyDrop borrow is forgotten, so the refcount
+    // gains exactly one for the returned RawWaker.
+    let probe = unsafe { Arc::<CountWake>::from_raw(data.cast::<CountWake>()) };
+    let cloned = Arc::clone(&probe);
+    std::mem::forget(probe);
+    RawWaker::new(Arc::into_raw(cloned).cast::<()>(), &COUNT_WAKE_VTABLE)
+}
+
+unsafe fn count_wake_wake(data: *const ()) {
+    // SAFETY: `data` is an owned `Arc<CountWake>` pointer; reconstruct and
+    // drop it after use.
+    let probe = unsafe { Arc::<CountWake>::from_raw(data.cast::<CountWake>()) };
+    probe.wakes.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe fn count_wake_wake_by_ref(data: *const ()) {
+    // SAFETY: `data` is a borrowed `Arc<CountWake>` pointer; the
+    // ManuallyDrop borrow is forgotten so the refcount is unchanged.
+    let probe = unsafe { Arc::<CountWake>::from_raw(data.cast::<CountWake>()) };
+    probe.wakes.fetch_add(1, Ordering::SeqCst);
+    std::mem::forget(probe);
+}
+
+unsafe fn count_wake_drop(data: *const ()) {
+    // SAFETY: `data` is an owned `Arc<CountWake>` pointer being released.
+    drop(unsafe { Arc::<CountWake>::from_raw(data.cast::<CountWake>()) });
+}
+
 impl CountWake {
-    pub fn waker() -> (std::task::Waker, Arc<Self>) {
+    pub fn waker() -> (Waker, Arc<Self>) {
         let probe = Arc::new(Self::default());
-        let waker = std::task::Waker::from(Arc::clone(&probe) as Arc<Self>);
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::clone(&probe)).cast::<()>(),
+            &COUNT_WAKE_VTABLE,
+        );
+        // SAFETY: the vtable functions implement the Arc refcount protocol
+        // exactly (clone increments, wake consumes, wake_by_ref borrows,
+        // drop releases) and the data pointer is a live `Arc<CountWake>`.
+        let waker = unsafe { Waker::from_raw(raw) };
         (waker, probe)
     }
 
     pub fn count(&self) -> usize {
         self.wakes.load(Ordering::SeqCst)
-    }
-}
-
-impl Wake for CountWake {
-    fn wake(self: Arc<Self>) {
-        self.wakes.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.wakes.fetch_add(1, Ordering::SeqCst);
     }
 }
 
