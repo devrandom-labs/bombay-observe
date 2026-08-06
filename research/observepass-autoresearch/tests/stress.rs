@@ -809,6 +809,74 @@ fn stress_duplicate_waiter_entry_stale_token_self_heals() {
     }
 }
 
+/// A waker whose `wake` calls the BLOCKING `wait` on the same generation
+/// during the drain: `complete` sets COMPLETED before the drain, so the
+/// reentrant wait returns immediately (never parks the completing thread),
+/// the drain finishes, and every waiter resolves exactly once.
+#[test]
+fn stress_wait_inside_wake_during_drain() {
+    use std::task::Wake;
+
+    struct WaitInWake {
+        obs: std::sync::Mutex<Option<observepass::Observation<u64>>>,
+        fires: AtomicUsize,
+        value: std::sync::Mutex<Option<u64>>,
+    }
+
+    impl Wake for WaitInWake {
+        fn wake(self: Arc<Self>) {
+            self.fires.fetch_add(1, Ordering::SeqCst);
+            let guard = self.obs.lock().expect("obs lock");
+            if let Some(obs) = guard.as_ref() {
+                // Reentrant blocking wait during the drain: COMPLETED is
+                // already set, so this returns immediately.
+                *self.value.lock().expect("value lock") = Some(obs.wait());
+            }
+        }
+    }
+
+    for round in 0..100_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+        let waker_obs = space.observe(&1).expect("subject retained");
+        let wait_obs = space.observe(&1).expect("subject retained");
+        let reentrant = Arc::new(WaitInWake {
+            obs: std::sync::Mutex::new(Some(waker_obs)),
+            fires: AtomicUsize::new(0),
+            value: std::sync::Mutex::new(None),
+        });
+        assert!(!wait_obs.register_waker(&std::task::Waker::from(reentrant.clone())));
+        // A second waiter (the drain must still resolve it after the
+        // reentrant wait).
+        let barrier = Arc::new(Barrier::new(2));
+        let other = {
+            let wait_obs = space.observe(&1).expect("subject retained");
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                wait_obs.wait()
+            })
+        };
+        barrier.wait();
+        subject.complete(round);
+        assert_eq!(
+            reentrant.fires.load(Ordering::SeqCst),
+            1,
+            "reentrant waker fired != once (round {round})"
+        );
+        assert_eq!(
+            *reentrant.value.lock().expect("value lock"),
+            Some(round),
+            "the in-drain wait must resolve to the exact outcome (round {round})"
+        );
+        assert_eq!(
+            other.join().expect("other waiter panicked"),
+            round,
+            "the drain must still resolve the other waiter (round {round})"
+        );
+    }
+}
+
 /// Pinned retired-pending generations never fabricate: observations
 /// captured on generations that are retired WITHOUT completing must time
 /// out forever (never resolve to a value), even while other generations on

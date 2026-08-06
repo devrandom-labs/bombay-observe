@@ -529,3 +529,10 @@ Affected version under test: workspace commit baseline `cd35234`
   ("stormers never contended") — a per-stormer 1000-attempts floor (the
   keeper guarantees every attempt conflicts) makes the canary
   structurally true. 8x suite re-runs stable. PASS (score 178).
+- Batch 24: `stress_wait_inside_wake_during_drain` — a waker whose `wake`
+  calls the BLOCKING `wait` on the same generation mid-drain: COMPLETED is
+  set before the drain, so the reentrant wait returns immediately (the
+  completing thread never parks), the drain finishes, the in-drain wait
+  resolves to the exact outcome, and a second waiter on the same
+  generation still resolves exactly once (100 rounds). PASS. Full-harness
+  stability sweep after the flake fixes: 5/5 gate runs green (score 179).
