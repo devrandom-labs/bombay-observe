@@ -2,7 +2,7 @@
 //! recycling, stale waiter/state bits surviving `reset`, and exactly-once
 //! outcome destruction across churn well beyond the pool capacity (128).
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use observepass::ObservationSpace;
@@ -362,6 +362,39 @@ fn completed_into_outcome_fires_waker_then_moves_outcome() {
             "the take must not fire the waker again (round {round})"
         );
     }
+}
+
+/// Hash-map scale churn: thousands of STRING keys (a keyspace neither the
+/// inline vector nor the small u8-key tests exercise) register/complete/
+/// retire with counted probes, twice over the same keys. The promoted
+/// hash map, the shared 128-slot pool, and the recycling path must keep
+/// exactly-once destruction at scale, and every retired key must
+/// re-register cleanly.
+#[test]
+fn hash_map_scale_churn_drops_exactly_once() {
+    const KEYS: u64 = 3000;
+    const ROUNDS: u64 = 2;
+
+    let space = ObservationSpace::<String, DropProbe>::new();
+    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+    let mut created = 0usize;
+
+    for round in 0..ROUNDS {
+        for key in 0..KEYS {
+            let k = format!("scale-key-{key}");
+            let mut subject = space.subject(k.clone()).expect("retired key re-registers");
+            subject.complete(DropProbe::with_counter(round * KEYS + key, &counter));
+            created += 1;
+            // drop(subject): retire; the slot is pooled or recycled.
+        }
+    }
+    drop(space);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        created,
+        "created {created} outcomes but observed {} drops at scale",
+        counter.load(Ordering::SeqCst)
+    );
 }
 
 /// Every waiter of a pooled-and-recycled slot's NEW generation is woken

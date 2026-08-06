@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use observepass::{Observation, ObservationFuture, ObservationSpace, Subject};
-use observepass_autoresearch::probe::{CountWake, poll_once};
+use observepass_autoresearch::probe::{CountWake, DropProbe, poll_once};
 use proptest::prelude::*;
 
 const KEYS: u8 = 8; // 2x INLINE_CAP: exercises inline and promoted maps
@@ -57,6 +57,33 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         1 => (0..16_usize).prop_map(Op::CancelFuture),
     ]
 }
+
+/// Ops for the churn drop-accounting property: no futures, focused on
+/// generation lifecycle, retention, and destruction accounting.
+#[derive(Debug, Clone, Copy)]
+enum ChurnOp {
+    Register(u8),
+    Complete(u8),
+    Observe(u8),
+    TryGet(usize),
+    Retire(u8),
+    DropObs(usize),
+    IntoOutcome(usize),
+}
+
+fn churn_op_strategy() -> impl Strategy<Value = ChurnOp> {
+    prop_oneof![
+        4 => (0..CHURN_KEYS).prop_map(ChurnOp::Register),
+        4 => (0..CHURN_KEYS).prop_map(ChurnOp::Complete),
+        3 => (0..CHURN_KEYS).prop_map(ChurnOp::Observe),
+        2 => (0..16_usize).prop_map(ChurnOp::TryGet),
+        3 => (0..CHURN_KEYS).prop_map(ChurnOp::Retire),
+        1 => (0..16_usize).prop_map(ChurnOp::DropObs),
+        1 => (0..16_usize).prop_map(ChurnOp::IntoOutcome),
+    ]
+}
+
+const CHURN_KEYS: u8 = 4;
 
 /// What the model knows about one key: absent from the map means vacant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +429,108 @@ proptest! {
     #[test]
     fn sequential_model_conformance(ops in prop::collection::vec(op_strategy(), 1..48)) {
         run_case(ops);
+    }
+}
+
+proptest! {
+    /// Retention/reclamation accounting at generation-churn scale: every
+    /// completed outcome plus every `try_get` clone must be destroyed
+    /// exactly once by full teardown, whatever the retire/re-register
+    /// interleaving (pool recycling, `reset` drops, `into_outcome` takes,
+    /// slot finals) — no leak, no double drop — while (epoch,key)-tagged
+    /// integrity holds throughout.
+    #[test]
+    fn churn_drop_accounting_exactly_once(
+        ops in prop::collection::vec(churn_op_strategy(), 1..64),
+    ) {
+        let space = ObservationSpace::<u8, DropProbe>::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut created = 0usize;
+        let mut subjects: HashMap<u8, Subject<u8, DropProbe>> = HashMap::new();
+        let mut epochs: HashMap<u8, u64> = HashMap::new();
+        let mut completed: HashMap<(u8, u64), bool> = HashMap::new();
+        let mut observations: Vec<(u8, u64, Observation<DropProbe>)> = Vec::new();
+
+        let tag = |key: u8, epoch: u64| (epoch << 8) | u64::from(key);
+
+        for op in ops {
+            match op {
+                ChurnOp::Register(key) => {
+                    if let Ok(subject) = space.subject(key) {
+                        let epoch = epochs.get(&key).map_or(0, |e| e + 1);
+                        epochs.insert(key, epoch);
+                        subjects.insert(key, subject);
+                    }
+                }
+                ChurnOp::Complete(key) => {
+                    if let Some(subject) = subjects.get_mut(&key) {
+                        let epoch = epochs[&key];
+                        if completed.insert((key, epoch), true).is_none() {
+                            subject.complete(DropProbe::with_counter(tag(key, epoch), &counter));
+                            created += 1;
+                        }
+                    }
+                }
+                ChurnOp::Observe(key) => {
+                    if let Ok(obs) = space.observe(&key) {
+                        observations.push((key, epochs[&key], obs));
+                    }
+                }
+                ChurnOp::TryGet(idx) => {
+                    if let Some((k, e, obs)) = observations.get(idx % observations.len().max(1)) {
+                        let expected = completed.get(&(*k, *e)).copied().unwrap_or(false);
+                        match obs.try_get() {
+                            Some(value) => {
+                                assert_eq!(value.tag, tag(*k, *e), "try_get cross-generation leak");
+                                assert!(expected, "try_get resolved a never-completed generation");
+                                created += 1;
+                            }
+                            None => assert!(!expected, "try_get lost a completed outcome"),
+                        }
+                    }
+                }
+                ChurnOp::Retire(key) => {
+                    if let Some(subject) = subjects.remove(&key) {
+                        drop(subject);
+                    }
+                }
+                ChurnOp::DropObs(idx) => {
+                    if !observations.is_empty() {
+                        observations.swap_remove(idx % observations.len());
+                    }
+                }
+                ChurnOp::IntoOutcome(idx) => {
+                    if observations.is_empty() {
+                        continue;
+                    }
+                    let (k, e, obs) = observations.swap_remove(idx % observations.len());
+                    let subject_gone = !subjects.contains_key(&k) || epochs[&k] != e;
+                    let done = completed.get(&(k, e)).copied().unwrap_or(false);
+                    let refs = observations
+                        .iter()
+                        .filter(|(k2, e2, _)| k2 == &k && e2 == &e)
+                        .count();
+                    let result = obs.into_outcome();
+                    if subject_gone && done && refs == 0 {
+                        let value = result.expect("into_outcome must move the last outcome");
+                        assert_eq!(value.tag, tag(k, e), "into_outcome wrong generation");
+                        drop(value);
+                    } else {
+                        assert!(result.is_none(), "into_outcome must refuse while shared/pending");
+                    }
+                }
+            }
+        }
+
+        drop(observations);
+        drop(subjects);
+        drop(space);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            created,
+            "created {created} values but observed {} drops",
+            counter.load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }
 

@@ -31,3 +31,9 @@ name = "promotion_ops"
 path = "fuzz_targets/promotion_ops.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "waker_ops"
+path = "fuzz_targets/waker_ops.rs"
+test = false
+doc = false

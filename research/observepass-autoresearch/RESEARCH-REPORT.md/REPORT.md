@@ -380,3 +380,35 @@ Affected version under test: workspace commit baseline `cd35234`
   registry lifecycle (consumed-slot entry destruction, drain-then-take)
   is clean under the interpreter.
   Result: PASS (4 tests; score 150).
+- Batch 16: (a) third proptest property (own `proptest!` block, +5) —
+  `churn_drop_accounting_exactly_once` in `tests/model.rs`: random
+  generation-churn sequences (register/complete/observe/try_get/retire/
+  drop-obs/into_outcome, 4 keys, ≤64 ops) over `DropProbe` outcomes
+  sharing one counter; created values (completions + `try_get` clones)
+  must equal drops after full teardown — pool recycling, `reset` drops,
+  `into_outcome` takes, and slot finals all accounted, no leak, no double
+  drop — with (epoch,key)-tagged integrity throughout. PASS (256 default
+  cases in the gate; PROPTEST_CASES override still applies).
+  (b) `tests/pool.rs` — `hash_map_scale_churn_drops_exactly_once`: 3,000
+  STRING keys (a keyspace neither the inline vector nor the u8-key tests
+  exercise) register/complete/retire twice over, 6,000 counted outcomes
+  destroyed exactly once at teardown; every retired key re-registers.
+  PASS.
+  (c) `fuzz/fuzz_targets/waker_ops.rs` (new target, +10): raw
+  `register_waker` accounting at fuzz scale over churned pooled slots —
+  a waker is REGISTERED exactly when its generation is pending, and once
+  registered must fire EXACTLY ONCE iff that generation eventually
+  completes (never otherwise, including slots that die pooled-and-reset
+  or consumed before completing); DropProbe accounting and tagged
+  integrity run alongside. 10,000,000 executions in 95s — NO CRASH.
+  (d) loom mixed-waiter drain model: ATTEMPTED and ABANDONED — the
+  mixed Thread+Waker drain under loom did not complete in three attempts:
+  (i) thread + wait_timeout + future waiters (4 threads) at bound 8
+  exceeded an hour; (ii) the same at bound 4 exceeded 15 minutes
+  standalone; (iii) thread + future waiters (3 threads, same size as the
+  fast two-waiters model) at bound 8 exceeded 15 minutes standalone —
+  the future's loom `block_on` machinery multiplies scheduling points far
+  beyond plain thread-waiter models. Failed experiments recorded per repo
+  rules; the mixed drain remains covered natively by stress topology A.
+  Loom file stays at 7 models.
+  Result: PASS (1 test + 1 property + 1 fuzz target; score 168).
