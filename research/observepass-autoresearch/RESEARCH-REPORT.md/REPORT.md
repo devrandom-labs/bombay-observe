@@ -8,6 +8,56 @@ the launcher are untouched. All artifacts live under
 Affected version under test: workspace commit baseline `cd35234`
 (`crates/observepass` 0.1.0).
 
+## FINDING-002: a panicking waker aborts the completion drain, stranding later waiters
+
+- **Severity**: medium-high — lost wakeup under an adversarial or buggy
+  user waker. `Wake` implementations are user code and the trait contract
+  does not forbid panics; one panicking waker silently disarms every
+  waiter registered after it on the same generation.
+- **Expected**: `complete` wakes every registered waiter regardless of an
+  earlier waker's panic (each wake isolated, e.g. via `catch_unwind` per
+  waiter, or drain-before-wake).
+- **Actual**: `Subject::complete` drains the waiter list and calls
+  `waker.wake()` / `thread.unpark()` in registration order. A panic
+  unwinds out of `complete` mid-drain; the remaining taken waiters are
+  dropped without firing. Consequences:
+  - A later `Waker` registration never fires (observed: 0 wakes).
+  - A parked thread waiter (`Observation::wait`) is never unparked and
+    hangs indefinitely (observed: thread still parked 100ms after
+    completion; `wait_timeout` waiters recover via their deadline recheck
+    and observe the outcome — the indefinite `wait` path does not).
+  - The panic propagates out of `complete` (documented behavior only
+    covers double-completion panics).
+  - The outcome itself IS published (COMPLETED set before the drain);
+    `try_get`/`register_waker` after the panic behave normally and drop
+    counts stay exactly-once (active test
+    `state_after_panicking_drain_stays_consistent` passes).
+- **Minimized counterexample** (deterministic): register panicking waker
+  W1, then good waker W2, then park a thread waiter (50ms settle);
+  `complete(42)` under `catch_unwind`; assert the parked thread finished
+  (it has not) and `W2.count() == 1` (it is 0). Cleanup unparks the
+  stranded thread manually so the repro exits.
+- **Reproduction**:
+
+  ```sh
+  cargo test --manifest-path research/observepass-autoresearch/Cargo.toml \
+    --test panic_safety -- --ignored
+  ```
+
+  `panicking_waker_must_not_strand_other_waiters` fails with
+  `a parked waiter was stranded by an earlier waker's panic` (and, past
+  that assertion, `a later waker was skipped ... (count 0)`). The
+  assertions express the correct expected behavior; no fix attempted.
+- **Adjacent state space**: waiters registered BEFORE the panicking waker
+  are drained first and fire normally (active test
+  `waiters_before_the_panicking_one_are_woken` passes) — the drain is
+  strictly ordered and the blast radius is "everything after the first
+  panic". Post-panic slot state is consistent (publication intact,
+  exactly-once drops; active test passes).
+- **Root cause (analysis, not fixed)**: the drain loop in
+  `Subject::complete` performs no panic isolation between waiter
+  notifications; the `mem::take`n remainder is dropped during unwind.
+
 ## FINDING-001: cancelling one future disarms sibling futures that share its waker
 
 - **Severity**: high — lost wakeup. In a real executor the surviving future
@@ -163,3 +213,12 @@ Affected version under test: workspace commit baseline `cd35234`
   thread fires 64 injected unparks at a blocked waiter while a second
   waiter registers, 100 rounds — every waiter resolved to the exact
   outcome, none left parked. Result: PASS (8 contract + 1 stress tests).
+- Batch 10 (`tests/panic_safety.rs`): drain panic-safety probes. FINDING-002
+  confirmed and preserved (panicking waker aborts the drain; later waker
+  skipped, parked `wait()` thread stranded indefinitely — deterministic
+  repro with `is_finished` + manual-unpark cleanup). Two active tests
+  pass: pre-panic waiters fire normally (ordered drain), post-panic slot
+  state consistent (publication + exactly-once drops). One test-accounting
+  bug fixed during development (`try_get` clone) — not a product defect.
+  Also documented: `wait_timeout` waiters self-heal via the deadline
+  recheck after a stranded drain (observed during minimization).
