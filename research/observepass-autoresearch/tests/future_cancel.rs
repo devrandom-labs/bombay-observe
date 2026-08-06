@@ -160,6 +160,36 @@ fn cancel_after_completion_is_unobservable() {
     drop(f);
 }
 
+/// The same waker registered TWICE — via two observations of one
+/// generation (which share the slot and its registry) — must be
+/// deduplicated by `will_wake` identity: one entry, exactly one fire at
+/// completion, and both observations resolve.
+#[test]
+fn same_waker_registered_twice_fires_once() {
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u32, u64>::new();
+        let mut subject = space.subject(37).expect("first registration succeeds");
+        let obs_a = space.observe(&37).expect("subject retained");
+        let obs_b = space.observe(&37).expect("subject retained");
+        let (waker, probe) = CountWake::waker();
+
+        assert!(!obs_a.register_waker(&waker), "pending: registration stored");
+        assert!(
+            !obs_b.register_waker(&waker),
+            "deduped re-registration still reports pending (round {round})"
+        );
+        subject.complete(round);
+
+        assert_eq!(
+            probe.count(),
+            1,
+            "a will_wake-deduped registration must fire exactly once (round {round})"
+        );
+        assert_eq!(obs_a.try_get(), Some(round));
+        assert_eq!(obs_b.try_get(), Some(round));
+    }
+}
+
 /// A future polled with MANY distinct wakers (a pathological executor
 /// rotating wakers every poll) must register each one, fire every one
 /// exactly once at completion, and deregister every one on drop.

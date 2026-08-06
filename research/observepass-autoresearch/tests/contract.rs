@@ -129,6 +129,28 @@ fn register_waker_true_on_retired_completed() {
     assert_eq!(probe.count(), 0, "no registration, no wake");
 }
 
+/// `register_waker` returning `true` (already published — nothing
+/// registered) must not interfere with a later `into_outcome` take: the
+/// value still moves out exactly once by the last handle.
+#[test]
+fn register_waker_true_then_into_outcome_takes() {
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(4).expect("first registration succeeds");
+        subject.complete(round);
+        let observation = space.observe(&4).expect("completed generation observable");
+        let (waker, probe) = observepass_autoresearch::probe::CountWake::waker();
+        assert!(observation.register_waker(&waker), "completed: nothing registered");
+        drop(subject); // retire; the observation is the last handle
+        assert_eq!(
+            observation.into_outcome(),
+            Some(round),
+            "a true-return registration must not block the take (round {round})"
+        );
+        assert_eq!(probe.count(), 0, "nothing was registered, nothing fires");
+    }
+}
+
 /// A blocking `wait` on an already-completed observation returns
 /// immediately, and can be repeated: waiting is idempotent on completion.
 #[test]

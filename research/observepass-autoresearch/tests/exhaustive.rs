@@ -436,10 +436,13 @@ fn check_waker_history(history: &[char]) {
     }
 }
 
-/// Exhaustive waker-drain histories (see `check_waker_history`).
+/// Exhaustive waker-drain histories (see `check_waker_history`): depth 6
+/// (6^6 = 46,656) plus depth 7 (6^7 = 279,936) — the full space, no
+/// sampling.
 #[test]
 fn exhaustive_waker_drain_histories() {
     enumerate_histories(&['R', 'C', 'O', 'W', 'X', 'D'], 6, check_waker_history);
+    enumerate_histories(&['R', 'C', 'O', 'W', 'X', 'D'], 7, check_waker_history);
 }
 
 /// Drop a space with pooled slots whose outcomes are probes: teardown must
