@@ -25,3 +25,9 @@ name = "future_ops"
 path = "fuzz_targets/future_ops.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "promotion_ops"
+path = "fuzz_targets/promotion_ops.rs"
+test = false
+doc = false

@@ -210,3 +210,42 @@ fn repolled_survivor_heals_registration() {
         "re-polled survivor must be woken at completion"
     );
 }
+
+/// The same task waker on two futures over TWO DIFFERENT generations (a
+/// `join!` over two subjects). Each generation owns its own slot and its
+/// own waiter registry, so FINDING-001's shared-entry mechanism (one
+/// observation, N futures, one deduped registration) cannot apply here:
+/// cancelling either future must leave the other's registry entry intact,
+/// and completing the survivor's generation fires the shared waker exactly
+/// once. Note two observations of the SAME generation share one slot, so
+/// that variant is FINDING-001 (covered by its own reproducers).
+#[test]
+fn same_waker_across_two_generations_survivor_resolves() {
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u32, u64>::new();
+        let mut subject_a = space.subject(23).expect("first registration succeeds");
+        let mut subject_b = space.subject(29).expect("second registration succeeds");
+        let obs_a = space.observe(&23).expect("subject retained");
+        let obs_b = space.observe(&29).expect("subject retained");
+        let (waker, probe) = CountWake::waker();
+
+        let mut fa = Box::pin(obs_a.into_future());
+        let mut fb = Box::pin(obs_b.into_future());
+        assert!(poll_once(fa.as_mut(), &waker).is_pending());
+        assert!(poll_once(fb.as_mut(), &waker).is_pending());
+
+        drop(fa); // cancel one arm of the join
+        subject_b.complete(round);
+
+        assert_eq!(
+            probe.count(),
+            1,
+            "shared waker fired != once (round {round}): per-generation entries must drain exactly once"
+        );
+        assert_eq!(poll_once(fb.as_mut(), &waker), Poll::Ready(round));
+
+        // Retire both generations cleanly. Completing A fires nothing:
+        // fa's registration was deregistered on drop.
+        subject_a.complete(round);
+    }
+}

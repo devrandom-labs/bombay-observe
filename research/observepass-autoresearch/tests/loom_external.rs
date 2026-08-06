@@ -202,3 +202,50 @@ fn loom_wait_timeout_completed_path() {
         assert_eq!(waiter.join().expect("waiter panicked"), Some(11));
     });
 }
+
+/// Promotion-boundary churn: five keys — INLINE_CAP is 4, so the fifth
+/// live registration promotes the key table to its hash form, and key 4
+/// registers after keys 0..=3 retired, so it pops any pooled slot
+/// (cross-key slot reuse). One thread registers/completes/retires each
+/// generation while another observes and waits. Values encode the key, so
+/// a recycled slot delivering a stale generation's value, or any cross-key
+/// mix-up under the promoted map, fails the tag check.
+#[test]
+fn loom_promotion_boundary_generation_isolation() {
+    builder().check(|| {
+        let space = Arc::new(ObservationSpace::<u8, u64>::new());
+
+        let publisher = {
+            let space = Arc::clone(&space);
+            thread::spawn(move || {
+                for key in 0..5_u8 {
+                    let mut subject = space.subject(key).expect("vacant key registers");
+                    subject.complete(u64::from(key) << 8);
+                    // subject drops at iteration end: retirement.
+                }
+            })
+        };
+        let observer = {
+            let space = Arc::clone(&space);
+            thread::spawn(move || {
+                for key in 0..5_u8 {
+                    // The publisher may not have registered `key` yet
+                    // (UnknownSubject is legal), or may have retired it
+                    // already; whatever generation is captured must be
+                    // exactly this key's.
+                    if let Ok(observation) = space.observe(&key) {
+                        let value = observation.wait();
+                        assert_eq!(
+                            value >> 8,
+                            u64::from(key),
+                            "observation of key {key} resolved to a foreign generation's value {value}"
+                        );
+                    }
+                }
+            })
+        };
+
+        publisher.join().expect("publisher panicked");
+        observer.join().expect("observer panicked");
+    });
+}

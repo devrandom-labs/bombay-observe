@@ -27,6 +27,16 @@ impl DropProbe {
             counter,
         )
     }
+
+    /// Like [`new`] but shares an existing counter across many probes, so a
+    /// whole campaign's values can be checked for exactly-once destruction
+    /// against one total.
+    pub fn with_counter(tag: u64, counter: &Arc<AtomicUsize>) -> Self {
+        Self {
+            counter: Arc::clone(counter),
+            tag,
+        }
+    }
 }
 
 impl Clone for DropProbe {
@@ -111,6 +121,72 @@ impl CountWake {
 
     pub fn count(&self) -> usize {
         self.wakes.load(Ordering::SeqCst)
+    }
+}
+
+/// A waker that unparks a captured thread on `wake`. Lets a test park a
+/// thread on a raw `register_waker` registration and observe exactly when
+/// the completion drain fired it: a lost wake then shows up as a hung
+/// park, which a watchdog can fail the test on.
+///
+/// Same hand-rolled single-static-vtable pattern as [`CountWake`], so
+/// `will_wake` stays reliable under Miri.
+#[derive(Debug)]
+pub struct ThreadWake {
+    thread: std::thread::Thread,
+}
+
+static THREAD_WAKE_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    thread_wake_clone,
+    thread_wake_wake,
+    thread_wake_wake_by_ref,
+    thread_wake_drop,
+);
+
+unsafe fn thread_wake_clone(data: *const ()) -> RawWaker {
+    // SAFETY: `data` is a live `Arc<ThreadWake>` pointer owned by the
+    // waker being cloned; the ManuallyDrop borrow is forgotten, so the
+    // refcount gains exactly one for the returned RawWaker.
+    let probe = unsafe { Arc::<ThreadWake>::from_raw(data.cast::<ThreadWake>()) };
+    let cloned = Arc::clone(&probe);
+    std::mem::forget(probe);
+    RawWaker::new(Arc::into_raw(cloned).cast::<()>(), &THREAD_WAKE_VTABLE)
+}
+
+unsafe fn thread_wake_wake(data: *const ()) {
+    // SAFETY: `data` is an owned `Arc<ThreadWake>` pointer; reconstruct
+    // and drop it after use.
+    let probe = unsafe { Arc::<ThreadWake>::from_raw(data.cast::<ThreadWake>()) };
+    probe.thread.unpark();
+}
+
+unsafe fn thread_wake_wake_by_ref(data: *const ()) {
+    // SAFETY: `data` is a borrowed `Arc<ThreadWake>` pointer; the
+    // ManuallyDrop borrow is forgotten so the refcount is unchanged.
+    let probe = unsafe { Arc::<ThreadWake>::from_raw(data.cast::<ThreadWake>()) };
+    probe.thread.unpark();
+    std::mem::forget(probe);
+}
+
+unsafe fn thread_wake_drop(data: *const ()) {
+    // SAFETY: `data` is an owned `Arc<ThreadWake>` pointer being released.
+    drop(unsafe { Arc::<ThreadWake>::from_raw(data.cast::<ThreadWake>()) });
+}
+
+impl ThreadWake {
+    pub fn waker() -> (Waker, Arc<Self>) {
+        let probe = Arc::new(Self {
+            thread: std::thread::current(),
+        });
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::clone(&probe)).cast::<()>(),
+            &THREAD_WAKE_VTABLE,
+        );
+        // SAFETY: the vtable functions implement the Arc refcount protocol
+        // exactly (clone increments, wake consumes, wake_by_ref borrows,
+        // drop releases) and the data pointer is a live `Arc<ThreadWake>`.
+        let waker = unsafe { Waker::from_raw(raw) };
+        (waker, probe)
     }
 }
 

@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use observepass::ObservationSpace;
-use observepass_autoresearch::probe::CountWake;
+use observepass_autoresearch::probe::{CountWake, ThreadWake};
 
 /// SplitMix64: deterministic, seedable, dependency-free.
 struct Rng(u64);
@@ -410,5 +410,65 @@ fn stress_registration_flood_wakes_each_once() {
     subject.complete(99);
     for (i, (_, probe)) in probes.iter().enumerate() {
         assert_eq!(probe.count(), 1, "waker {i} fired != once");
+    }
+}
+
+/// Raw-API waker registration racing completion: the waiter thread calls
+/// `register_waker` directly (no future), then blocks on `park`.
+/// `register_waker` returning `false` is a promise: "registered, you WILL
+/// be woken". The completion drain must fire the waker whether the
+/// registration won or lost the race. A lost wake strands the parked
+/// waiter; the `recv_timeout` watchdog turns that into a hard failure
+/// (and `Ok(None)` would catch a wake fired before the publication was
+/// observable, an ordering violation).
+#[test]
+fn stress_register_waker_racing_completion_no_lost_wake() {
+    const ROUNDS: u64 = 400;
+
+    let space = Arc::new(ObservationSpace::<u8, u64>::new());
+    for round in 0..ROUNDS {
+        let key = (round % 2) as u8;
+        let mut subject = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(), // previous round's subject not yet dropped
+            }
+        };
+        let observation = space.observe(&key).expect("live generation");
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let (waker, _) = ThreadWake::waker();
+                if observation.register_waker(&waker) {
+                    // Already published: nothing registered, read directly.
+                    tx.send(observation.try_get()).expect("send failed");
+                    return;
+                }
+                // Registered: block until the completion drain unparks us.
+                // A lost wakeup strands this park forever -> watchdog.
+                std::thread::park();
+                tx.send(observation.try_get()).expect("send failed");
+            })
+        };
+        barrier.wait();
+        // Bias one round in four toward the registered-then-completed
+        // ordering (registration wins the race); the rest race freely.
+        if round % 4 == 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+        subject.complete(round);
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(outcome)) => assert_eq!(outcome, round, "wrong outcome (round {round})"),
+            Ok(None) => panic!(
+                "register_waker returned false but the outcome was not readable after the wake (round {round})"
+            ),
+            Err(_) => panic!(
+                "register_waker returned false but no wake arrived: waiter stranded (round {round})"
+            ),
+        }
+        waiter.join().expect("waiter panicked");
     }
 }

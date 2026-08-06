@@ -276,3 +276,77 @@ Affected version under test: workspace commit baseline `cd35234`
   `stress_registration_flood_wakes_each_once` (25.6s) — all PASS. The
   multi-threaded stress topologies remain excluded from Miri
   (interpretation cost scales with thread spawns); stated, not silent.
+- Batch 14: three new seams plus one coverage gap closed.
+  (a) `tests/stress.rs` — `stress_register_waker_racing_completion_no_lost_wake`:
+  the raw `register_waker` API (no future) racing completion from another
+  thread, 400 rounds with a barrier (1-in-4 rounds delayed so the
+  registered-then-completed ordering is forced). A `false` return is a
+  promise to wake; the waiter blocks on `park` and a `recv_timeout`
+  watchdog turns a lost wake into a hard failure (and `Ok(None)` would
+  catch a wake fired before the publication was observable — an ordering
+  violation). PASS: every round woke and read the exact outcome.
+  (b) `tests/future_cancel.rs` — `same_waker_across_two_generations_survivor_resolves`:
+  one task waker driving two futures over TWO different generations (a
+  `join!` over two subjects); cancelling one must not touch the other's
+  registry entry, and completing the survivor fires the shared waker
+  exactly once (50 rounds). PASS. First draft used two observations of ONE
+  generation — but `observe` twice returns the SAME slot (one registry),
+  which is exactly FINDING-001's shared-entry topology; the draft failed
+  with 0 wakes and was rewritten to the distinct topology. Recorded as a
+  harness-design correction, not a new finding (the existing FINDING-001
+  reproducers already cover that topology).
+  (c) `fuzz/fuzz_targets/promotion_ops.rs` (new target, +10): 6-key
+  keyspace — the fifth live generation promotes the inline key table to
+  its hash form, a path the existing `ops` target (4 keys = INLINE_CAP)
+  provably never exercises. Ops: register/complete/observe/try_get/retire/
+  into_outcome/drop, with `DropProbe` outcomes sharing ONE drop counter:
+  created values (completions + successful `try_get` clones) must equal
+  drops after full teardown — a leak or double-drop is a crash artifact —
+  and (epoch,key)-tagged integrity catches any cross-generation or
+  cross-key leakage. Validation: 3,000,000 executions in 18s, NO CRASH;
+  10,000,000-execution campaign in 113s, NO CRASH. One fuzz-harness bug
+  fixed during bring-up (`assert_eq!(Option<DropProbe>, None)` requires
+  `PartialEq`) — not a product defect.
+  (d) `tests/loom_external.rs` — `loom_promotion_boundary_generation_isolation`
+  (7th model): five keys under bound 8 — the fifth registration promotes
+  the map, and key 4 registers after keys 0..=3 retired, so it pops any
+  pooled slot (cross-key reuse). Publisher thread registers/completes/
+  retires each generation; observer thread captures whatever generation is
+  live per key and asserts the value's key tag — a recycled slot
+  delivering a stale generation's value, or any mix-up under the promoted
+  map, fails. COMPLETE (no truncation) at preemption bound 8, PASS —
+  but the model is the expensive one: 943s release (the other six models
+  complete in ~1.2s total). Cost noted for future loom batches.
+  Explored-and-closed (recorded, no finding): (i) recycle-mid-drain — a
+  waker that drops the subject during `complete`'s drain could pool the
+  slot while the drain is still waking later waiters; `reset`'s safety
+  comment states the invariant ("no waiter can be in flight: a live waiter
+  holds an observation Arc, and pooled slots have none") — a live
+  waiter/observer keeps `strong_count > 1`, so the slot cannot be pooled
+  while any waiter could still observe; orphaned waker entries are cleared
+  by `reset`, and fires to them are contractually spurious. Closed.
+  (ii) wait_timeout deadline boundary — `park_until` returns true after
+  every timed park and the loop re-checks COMPLETED before any further
+  deadline test, so a completion racing the deadline is always observed;
+  `None` implies the publication genuinely came after deregistration.
+  Closed. (iii) `subject()` restores the popped pooled slot on
+  `SubjectExists` (no pool leak on failed registration). Confirmed.
+  (iv) register_waker's recheck-and-push are atomic under the waiters
+  mutex (the drain takes under the same lock), so a registration can never
+  land after a drain that missed it. Closed.
+  (e) Miri on the model property — Batch 7's exclusion lifted at reduced
+  scale. The `model` target (proptest) needs
+  `MIRIFLAGS="-Zmiri-isolation-error=warn"`: proptest's
+  `FileFailurePersistence` calls `getcwd` at runner setup, which Miri
+  isolation blocks; the flag makes that one op return an error (proptest
+  falls back to the relative persistence path; no cases failed, so
+  nothing wrote) while isolation stays enabled. With
+  `PROPTEST_CASES=4` both properties PASS under Miri 0.1.0 (nightly
+  2026-08-05), 5,991s interpreted — the reference model's
+  register_waker / future / into_outcome machinery is Miri-clean. The
+  runtime also empirically confirms Batch 7's exclusion rationale: 16
+  cases exceeded 30 minutes interpreted (aborted), 4 cases took 100
+  minutes. Full-case Miri on `model` remains impractical; the reduced
+  run is stated, not silent.
+  Result: PASS (2 tests + 1 fuzz target + 1 loom model + Miri model 2/2
+  at 4 cases).
