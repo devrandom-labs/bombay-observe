@@ -412,3 +412,28 @@ Affected version under test: workspace commit baseline `cd35234`
   rules; the mixed drain remains covered natively by stress topology A.
   Loom file stays at 7 models.
   Result: PASS (1 test + 1 property + 1 fuzz target; score 168).
+- Batch 17 (`tests/stress.rs`, 3 tests): (a)
+  `stress_mixed_waiter_drain_all_resolved` — the abandoned loom mixed-drain
+  topology, natively: two blocking thread waiters, two `wait_timeout`
+  waiters, and two raw waker registrations on ONE generation racing one
+  completion, 200 rounds. Every waiter resolves exactly once to the exact
+  outcome; a waker-path waiter handles both legal outcomes of its
+  `register_waker` race (registered-and-woken, or already-published). PASS.
+  (b) `stress_same_key_contention_exactly_one_winner` — a pre-race
+  generation is captured, completed, retired; then two contenders race
+  `subject(key)` for the vacant key. Exactly one wins; the pre-race
+  observation resolves to the pre-race value (never the winner's); the
+  winner's published generation is observable while retained. 500 rounds.
+  Two harness-design lessons recorded (not product defects): a one-shot
+  barrier does not force contention (the first contender can complete,
+  retire, and free the key before the second thread is scheduled — both
+  then win sequentially and legally), and a `match`-arm-bound subject is
+  dropped at the arm's end, retiring the key before the overlap window
+  closes — the subject must be bound outside the arm and held across a
+  second barrier. PASS. (c) `stress_pinned_pending_timeout_never_fabricates`
+  — observations pinned on generations retired WITHOUT completing must
+  time out forever (never fabricate), even while a churn generation on the
+  same key completes concurrently, 200 rounds; the threaded twin of
+  pool.rs's `uncompleted_generation_recycles_without_fabricating`. PASS.
+  Stress suite re-run 3x, no flakes.
+  Result: PASS (3 tests; score 170).

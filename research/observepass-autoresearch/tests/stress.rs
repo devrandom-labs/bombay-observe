@@ -10,7 +10,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use observepass::ObservationSpace;
+use observepass::{ObservationSpace, Subject};
 use observepass_autoresearch::probe::{CountWake, DropProbe, ThreadWake};
 
 /// SplitMix64: deterministic, seedable, dependency-free.
@@ -533,4 +533,235 @@ fn stress_subject_exists_storm_pool_churn() {
         CHURN as usize,
         "completed outcomes must be destroyed exactly once under the storm"
     );
+}
+
+/// Mixed drain on ONE generation: two blocking thread waiters, two
+/// `wait_timeout` waiters, and two raw waker registrations, all racing one
+/// completion. The drain must resolve every waiter exactly once with the
+/// exact outcome — the native counterpart of the loom mixed-drain model
+/// that proved infeasible under the scheduler (recorded in Batch 16).
+#[test]
+fn stress_mixed_waiter_drain_all_resolved() {
+    const ROUNDS: u64 = 200;
+
+    let space = Arc::new(ObservationSpace::<u8, u64>::new());
+    for round in 0..ROUNDS {
+        let key = (round % 2) as u8;
+        let mut subject = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let barrier = Arc::new(Barrier::new(7)); // 6 waiters + publisher
+
+        let thread_waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let observation = space.observe(&key).expect("live generation");
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    observation.wait()
+                })
+            })
+            .collect();
+
+        let timeout_waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let observation = space.observe(&key).expect("live generation");
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    observation.wait_timeout(Duration::from_secs(5))
+                })
+            })
+            .collect();
+
+        let waker_waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let observation = space.observe(&key).expect("live generation");
+                let barrier = Arc::clone(&barrier);
+                let (waker, probe) = CountWake::waker();
+                thread::spawn(move || {
+                    barrier.wait();
+                    // Either the registration won (false: will be woken) or
+                    // the completion won (true: already published) — both
+                    // legal; the outcome must be readable either way.
+                    if !observation.register_waker(&waker) {
+                        // Spin until the waker fires, then read. A lost
+                        // wake strands this loop; the deadline fails it.
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while probe.count() == 0 {
+                            if std::time::Instant::now() > deadline {
+                                panic!("registered waker never fired");
+                            }
+                            thread::yield_now();
+                        }
+                    }
+                    observation
+                        .try_get()
+                        .expect("outcome must be readable after the wake")
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        subject.complete(round);
+
+        for waiter in thread_waiters {
+            assert_eq!(waiter.join().expect("thread waiter panicked"), round);
+        }
+        for waiter in timeout_waiters {
+            assert_eq!(
+                waiter.join().expect("timeout waiter panicked"),
+                Some(round),
+                "timeout waiter must resolve to the exact outcome"
+            );
+        }
+        for waiter in waker_waiters {
+            assert_eq!(
+                waiter.join().expect("waker waiter panicked"),
+                round,
+                "waker waiter must resolve to the exact outcome"
+            );
+        }
+    }
+}
+
+/// Same-key contention: a generation is captured and retired, then two
+/// threads race `subject(key)` for the now-vacant key from a barrier.
+/// Exactly one must win; the loser gets `SubjectExists`. The pre-race
+/// observation must resolve to the pre-race generation's value (never the
+/// winner's), and the winner's own generation must be observable with its
+/// tagged value. 500 rounds, value tags identify the winning publisher.
+#[test]
+fn stress_same_key_contention_exactly_one_winner() {
+    const ROUNDS: u64 = 500;
+
+    let space = Arc::new(ObservationSpace::<u8, u64>::new());
+    for round in 0..ROUNDS {
+        let key = (round % 2) as u8;
+        // Pre-race generation: captured, completed, retired.
+        let mut subject = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let observer = space.observe(&key).expect("live generation");
+        subject.complete(round);
+        drop(subject); // retire: the key is vacant for the contenders
+
+        // Two-phase barrier: `start` releases both contenders together;
+        // `release` is crossed only AFTER both have attempted subject().
+        // A one-shot barrier is not enough — the first contender could
+        // complete, retire, and free the key before the second thread is
+        // even scheduled, which is not a race at all.
+        let start = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let contender = |tag: u64, start: &Arc<Barrier>, release: &Arc<Barrier>| {
+            let space = Arc::clone(&space);
+            let start = Arc::clone(start);
+            let release = Arc::clone(release);
+            thread::spawn(move || {
+                start.wait();
+                // Register, binding the subject OUTSIDE the match: it must
+                // stay alive across `release` so both attempts overlap.
+                // (A match-arm local would retire at the arm's end, freeing
+                // the key before the other contender even tries.)
+                let won: Option<Subject<u8, u64>> = space.subject(key).ok();
+                release.wait();
+                match won {
+                    Some(mut subject) => {
+                        subject.complete((tag << 56) | round);
+                        // The published generation must be observable while
+                        // still retained (before this subject retires).
+                        assert_eq!(
+                            space.observe(&key).expect("winner retained").try_get(),
+                            Some((tag << 56) | round),
+                            "winner's published generation not observable"
+                        );
+                        Some(tag)
+                    }
+                    None => None,
+                }
+            })
+        };
+        let a = contender(1, &start, &release);
+        let b = contender(2, &start, &release);
+        start.wait();
+        release.wait();
+        let winner_a = a.join().expect("contender A panicked");
+        let winner_b = b.join().expect("contender B panicked");
+        let winners = usize::from(winner_a.is_some()) + usize::from(winner_b.is_some());
+        assert_eq!(winners, 1, "round {round}: exactly one subject must win the key");
+        let _winner = winner_a.or(winner_b).expect("a winner exists");
+
+        // The pre-race observation resolves to the pre-race value, never
+        // the winner's.
+        assert_eq!(
+            observer.wait(),
+            round,
+            "round {round}: pre-race observer resolved to the winner's generation"
+        );
+        // The winner's subject dropped when its contender thread ended:
+        // the key is vacant for the next round.
+    }
+}
+
+/// Pinned retired-pending generations never fabricate: observations
+/// captured on generations that are retired WITHOUT completing must time
+/// out forever (never resolve to a value), even while other generations on
+/// the same key complete concurrently. The threaded twin of pool.rs's
+/// `uncompleted_generation_recycles_without_fabricating`.
+#[test]
+fn stress_pinned_pending_timeout_never_fabricates() {
+    const ROUNDS: u64 = 200;
+
+    let space = Arc::new(ObservationSpace::<u8, u64>::new());
+    for round in 0..ROUNDS {
+        let key = (round % 2) as u8;
+        // Capture a generation, retire it WITHOUT completing. Two handles
+        // to the same slot: one stays on this thread, one goes to the
+        // waiter.
+        let subject = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let pinned = space.observe(&key).expect("live generation");
+        let pinned_waiter = space.observe(&key).expect("live generation");
+        drop(subject); // retire pending; both handles hold the old slot
+
+        // Churn a NEW generation on the same key to completion while the
+        // pinned observation waits: it must never see the new value.
+        let mut churn = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let waiter = {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                // The old slot never completes; this must always time out.
+                pinned_waiter.wait_timeout(Duration::from_millis(20))
+            })
+        };
+        barrier.wait();
+        churn.complete(round);
+        assert_eq!(
+            waiter.join().expect("waiter panicked"),
+            None,
+            "a retired-pending generation must never fabricate an outcome (round {round})"
+        );
+        assert_eq!(
+            pinned.try_get(),
+            None,
+            "the pinned observation must stay pending (round {round})"
+        );
+    }
 }
