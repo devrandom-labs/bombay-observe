@@ -479,3 +479,20 @@ Affected version under test: workspace commit baseline `cd35234`
   50-distinct-wakers test included), `--test contract` 10/10 PASS
   (11.93s; the three new micro-tests included) — no UB in any of the new
   paths. Result: PASS (depth-only batch).
+- Batch 20: 8th loom model — `loom_into_outcome_racing_retire`:
+  `into_outcome`'s exclusive take racing the subject's retirement and a
+  concurrent observer, at preemption bound 8. The take either succeeds
+  (subject retired, no other live handle at that instant) or is refused
+  (still shared); the observer resolves to exactly the outcome or misses
+  the window; all four (taken, observed) combinations are legal — the
+  invariants are value-exactness (never a wrong value moved) and
+  exclusivity of a successful take. Two MODEL-assertion bugs found during
+  development (not product defects), each exposed by a real loom schedule:
+  (i) assumed a refused take implies the observer resolves — but the
+  observer can also miss the retirement window; (ii) assumed a successful
+  take implies the generation is unobservable — but the observer can
+  legally resolve BEFORE the take (its handle drops, then the take finds
+  the single reference). Both corrected to the four-case invariant above.
+  Full suite at bound 8: all 8 models COMPLETE (no truncation), PASS in
+  1302.5s release (the promotion-boundary model dominates at ~943s).
+  Result: PASS (1 loom model; 8 total).

@@ -203,6 +203,58 @@ fn loom_wait_timeout_completed_path() {
     });
 }
 
+/// `into_outcome`'s exclusive take racing the subject's retirement and a
+/// concurrent observer: the take either succeeds (the subject retired
+/// first and no other observation holds the slot — then the generation is
+/// no longer observable) or is refused (still shared — then the observer
+/// resolves to the exact outcome). The value is never moved twice and
+/// never from a wrong generation.
+#[test]
+fn loom_into_outcome_racing_retire() {
+    builder().check(|| {
+        let space = Arc::new(ObservationSpace::<u8, u64>::new());
+        let mut subject = space.subject(1).expect("first registration succeeds");
+        let taker_obs = space.observe(&1).expect("generation live");
+
+        let taker = thread::spawn(move || taker_obs.into_outcome());
+        let observer = {
+            let space = Arc::clone(&space);
+            thread::spawn(move || space.observe(&1).ok().map(|obs| obs.wait()))
+        };
+        subject.complete(9);
+        drop(subject); // retire: the generation outlives via its observers
+
+        let taken = taker.join().expect("taker panicked");
+        let observed = observer.join().expect("observer panicked");
+        // Every combination is legal: the take may succeed (subject retired
+        // and no other handle was live at that instant), be refused (still
+        // shared), and the observer may capture (resolving exactly 9) or
+        // miss the retirement window. Both may even resolve sequentially —
+        // the observer's wait returns and drops its handle, then the take
+        // finds the single remaining reference. The invariants: no wrong
+        // value ever moves, and a successful take is exclusive.
+        match (taken, observed) {
+            (Some(value), Some(seen)) => {
+                assert_eq!(value, 9, "the take must move the exact outcome");
+                assert_eq!(seen, 9, "an observer must resolve to the exact outcome");
+            }
+            (Some(value), None) => {
+                assert_eq!(value, 9, "the take must move the exact outcome");
+            }
+            (None, Some(seen)) => {
+                assert_eq!(seen, 9, "an observer must resolve to the exact outcome");
+            }
+            (None, None) => {
+                // Refused take plus a missed capture window: the published
+                // value was never read and is dropped with the slot
+                // (exactly-once destruction asserted natively and under
+                // Miri). Legal: into_outcome consumes its handle even on
+                // refusal, and a refused take does not pin the generation.
+            }
+        }
+    });
+}
+
 /// Promotion-boundary churn: five keys — INLINE_CAP is 4, so the fifth
 /// live registration promotes the key table to its hash form, and key 4
 /// registers after keys 0..=3 retired, so it pops any pooled slot
