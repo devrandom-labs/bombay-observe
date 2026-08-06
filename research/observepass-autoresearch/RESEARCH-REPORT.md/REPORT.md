@@ -152,3 +152,14 @@ Affected version under test: workspace commit baseline `cd35234`
   harness, input `[10]`) — not a product defect. The shared-waker
   topology is deliberately excluded from `future_ops` (FINDING-001,
   preserved separately). Corpus not committed (regenerable; 4.3MB).
+- Batch 9 (`tests/contract.rs`, `tests/stress.rs` additions): API-contract
+  defenses — double-complete panics AND the first outcome survives the
+  attempted second publication; `SubjectExists`/`UnknownSubject` carry the
+  key; `wait_timeout(Duration::MAX)` panics (documented Instant overflow);
+  huge valid timeout on a completed observation returns immediately;
+  move-only (non-Clone) outcome flows through `into_outcome` exactly
+  once; shared slot refuses `into_outcome`; cloned spaces share the
+  namespace across drops. Spurious-unpark injection stress: external
+  thread fires 64 injected unparks at a blocked waiter while a second
+  waiter registers, 100 rounds — every waiter resolved to the exact
+  outcome, none left parked. Result: PASS (8 contract + 1 stress tests).

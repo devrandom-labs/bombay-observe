@@ -263,6 +263,59 @@ fn stress_reentrant_wake_drops_observation() {
     }
 }
 
+/// Spurious-unpark injection: an external thread fires extra unparks at a
+/// blocked waiter while a second waiter registers concurrently, stressing
+/// the duplicate-registration dedup (`waiters.last()` check). Whatever the
+/// internal duplication, every waiter must still resolve to the exact
+/// outcome and no waiter may be left parked.
+#[test]
+fn stress_spurious_unpark_injection() {
+    const ROUNDS: u64 = 100;
+
+    let space = std::sync::Arc::new(ObservationSpace::<u8, u64>::new());
+    for round in 0..ROUNDS {
+        let key = (round % 2) as u8;
+        let mut subject = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let start = std::sync::Arc::new(Barrier::new(4));
+        let mk_waiter = || {
+            let observation = space.observe(&key).expect("live generation");
+            let start = std::sync::Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                observation.wait()
+            })
+        };
+        let waiter_a = mk_waiter();
+        let waiter_b = mk_waiter();
+        let handle_a = waiter_a.thread().clone();
+
+        let injector = {
+            let start = std::sync::Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..64 {
+                    handle_a.unpark(); // injected spurious wakeups
+                    thread::yield_now();
+                }
+            })
+        };
+        start.wait();
+        // Let the injection interleave with registration, then complete.
+        for _ in 0..32 {
+            thread::yield_now();
+        }
+        subject.complete(round);
+        injector.join().expect("injector panicked");
+        assert_eq!(waiter_a.join().expect("waiter A panicked"), round);
+        assert_eq!(waiter_b.join().expect("waiter B panicked"), round);
+    }
+}
+
 /// Registration flood: hundreds of distinct wakers on one pending
 /// generation, each must fire exactly once at completion.
 #[test]
