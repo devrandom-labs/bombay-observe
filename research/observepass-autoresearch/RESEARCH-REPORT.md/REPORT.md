@@ -234,3 +234,9 @@ Affected version under test: workspace commit baseline `cd35234`
   bug fixed during development (`try_get` clone) — not a product defect.
   Also documented: `wait_timeout` waiters self-heal via the deadline
   recheck after a stranded drain (observed during minimization).
+- Batch 11 (`tests/stress.rs` additions): reentrant self-registration — a
+  waker that re-registers on the same slot inside `wake` (50 rounds):
+  re-registration sees COMPLETED, fires exactly once, no deadlock.
+  Subject thread migration (register/complete/retire on three different
+  threads, waiter on a fourth, 100 rounds): exact outcome every round.
+  Result: PASS (2 tests).

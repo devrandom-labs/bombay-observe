@@ -316,6 +316,83 @@ fn stress_spurious_unpark_injection() {
     }
 }
 
+/// A waker whose `wake` re-registers ITSELF on the same slot (reentrant
+/// registration during the drain) must not deadlock or loop: the
+/// re-registration sees COMPLETED and returns immediately.
+#[test]
+fn stress_reentrant_wake_reregistration_no_loop() {
+    use std::task::Wake;
+
+    struct ReRegister {
+        obs: std::sync::Mutex<Option<observepass::Observation<u64>>>,
+        fires: AtomicUsize,
+    }
+
+    impl Wake for ReRegister {
+        fn wake(self: Arc<Self>) {
+            self.fires.fetch_add(1, Ordering::SeqCst);
+            let guard = self.obs.lock().expect("obs lock");
+            if let Some(obs) = guard.as_ref() {
+                // Reentrant registration mid-drain: must return `true`
+                // (already completed) without registering again.
+                let (waker, _) = CountWake::waker();
+                assert!(obs.register_waker(&waker), "re-registration must see COMPLETED");
+            }
+        }
+    }
+
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+        let obs = space.observe(&1).expect("subject retained");
+        let re = Arc::new(ReRegister {
+            obs: std::sync::Mutex::new(Some(space.observe(&1).expect("subject retained"))),
+            fires: AtomicUsize::new(0),
+        });
+        assert!(!obs.register_waker(&std::task::Waker::from(re.clone())));
+        subject.complete(round);
+        assert_eq!(
+            re.fires.load(Ordering::SeqCst),
+            1,
+            "reentrant waker fired != once (round {round})"
+        );
+    }
+}
+
+/// Subject lifecycle migration: register on one thread, complete on a
+/// second, retire on a third; a waiter on a fourth must observe the exact
+/// outcome. The generation protocol must not depend on thread affinity.
+#[test]
+fn stress_subject_thread_migration() {
+    let space = Arc::new(ObservationSpace::<u8, u64>::new());
+    for round in 0..100_u64 {
+        let key = (round % 3) as u8;
+        let subject = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let waiter = {
+            let observation = space.observe(&key).expect("live generation");
+            thread::spawn(move || observation.wait())
+        };
+        let mut subject = thread::spawn(move || subject)
+            .join()
+            .expect("migration thread 1 panicked");
+        let subject = thread::spawn(move || {
+            subject.complete(round);
+            subject
+        })
+        .join()
+        .expect("migration thread 2 panicked");
+        assert_eq!(waiter.join().expect("waiter panicked"), round);
+        thread::spawn(move || drop(subject))
+            .join()
+            .expect("migration thread 3 panicked");
+    }
+}
+
 /// Registration flood: hundreds of distinct wakers on one pending
 /// generation, each must fire exactly once at completion.
 #[test]
