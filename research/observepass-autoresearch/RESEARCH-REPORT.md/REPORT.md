@@ -100,3 +100,16 @@ Affected version under test: workspace commit baseline `cd35234`
   ordered double-retirement pairs; all poll-count/completion/cancellation
   orderings for futures. Result: PASS (6 tests, ~19.5k histories + all
   permutations).
+- Batch 5 (`tests/stress.rs`): deterministic adversarial stress, real
+  threads, barrier-synchronized, fixed-seed SplitMix64 op selection.
+  Topology A: 2 publishers x 2 keys x 2,000 rounds vs 4 observers x 2,000
+  iterations (try_get / wait_timeout(50ms) / register-and-drop cancellation
+  storm / blocking wait), outcome tags checked per read (publisher, round,
+  key encoding) — 0 wrong-tag reads. Topology B: 8 waiters fanned out on
+  one generation x 200 rounds, exact-outcome assertion — 0 failures.
+  Topology C: wait_timeout(0)/wait_timeout(1ns) boundary storm vs
+  completion x 500 rounds — every Some carried the exact outcome, every
+  round observed completion. Reentrant wake test: a waker whose wake()
+  drops another observation of the same generation during the drain —
+  100 rounds, fired exactly once each, no deadlock. Registration flood:
+  256 distinct wakers, each fired exactly once. Result: PASS (5 tests).
