@@ -470,3 +470,12 @@ Affected version under test: workspace commit baseline `cd35234`
   read independent of scheduling. 20/20 suite runs clean. The canary
   remains as a belt-and-suspenders guard (reads >= 4 by construction).
   Result: PASS (4 tests; score 174).
+- Batch 19 (long-run evidence sweep, no score change): all four fuzz
+  targets re-run at 20,000,000 executions each — `ops` 305s, `future_ops`
+  177s, `promotion_ops` 308s, `waker_ops` 308s; 80M executions total, NO
+  CRASH on any target. `PROPTEST_CASES=100000` on all three properties:
+  3/3 PASS in 3.47s release. Miri re-confirmation after Batches 15-18:
+  `--test future_cancel` 11/11 PASS (3.08s interpreted; the new
+  50-distinct-wakers test included), `--test contract` 10/10 PASS
+  (11.93s; the three new micro-tests included) — no UB in any of the new
+  paths. Result: PASS (depth-only batch).
