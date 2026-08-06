@@ -18,7 +18,7 @@ use loom::thread;
 
 use observepass::ObservationSpace;
 
-const PREEMPTIONS: usize = 7;
+const PREEMPTIONS: usize = 8;
 
 fn builder() -> loom::model::Builder {
     let mut builder = loom::model::Builder::new();

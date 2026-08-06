@@ -267,3 +267,12 @@ Affected version under test: workspace commit baseline `cd35234`
   before the publisher ran under load — one flake observed, fixed to
   loop-until-completion, which is guaranteed); two lint-level cleanups.
   Result: PASS (1 test + 1 property added).
+- Batch 13: Loom depth pushed to preemption bound 8 — all 6 models
+  COMPLETE (52.5s release; bound constant updated to 8, bounds 3-7
+  completed earlier: 0.2s / 1.1s / 4.0s / 11.7s / 27.6s). Miri extended
+  to the single-threaded stress subset:
+  `stress_reentrant_wake_drops_observation` (11.6s interpreted),
+  `stress_reentrant_wake_reregistration_no_loop` (4.2s),
+  `stress_registration_flood_wakes_each_once` (25.6s) — all PASS. The
+  multi-threaded stress topologies remain excluded from Miri
+  (interpretation cost scales with thread spawns); stated, not silent.
