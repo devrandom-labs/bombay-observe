@@ -342,6 +342,106 @@ fn exhaustive_double_retire_orders() {
     }
 }
 
+/// Every history over the alphabet {R=register, C=complete, O=observe,
+/// W=register_waker, X=retire, D=drop one obs} to depth 6 (6^6 = 46656) —
+/// the strongest non-sampled coverage of the register_waker / drain
+/// protocol. A waker is REGISTERED exactly when its observation's
+/// generation is still pending (register_waker returns `false`); once
+/// registered, it must fire EXACTLY ONCE iff that generation eventually
+/// completes, and never otherwise — including when the slot dies (pooled
+/// and reset, or consumed) before completing. Observation resolution is
+/// also checked against the model after every op.
+fn check_waker_history(history: &[char]) {
+    let space = ObservationSpace::<u8, u64>::new();
+    let mut subject: Option<Subject<u8, u64>> = None;
+    let mut epoch: u64 = 0;
+    let mut live: Option<bool> = None; // Some(completed)
+    // epoch -> completed (completed generations keep their outcome; the
+    // drain fires exactly the wakers registered at completion time).
+    let mut completed: HashMap<u64, bool> = HashMap::new();
+    let mut observations: Vec<(u64, Observation<u64>)> = Vec::new();
+    // (epoch, probe) of every successfully registered waker.
+    let mut registered: Vec<(u64, std::sync::Arc<CountWake>)> = Vec::new();
+
+    for &op in history {
+        match op {
+            'R' => {
+                if live.is_none() {
+                    subject = Some(space.subject(0).expect("{history:?}: vacant register failed"));
+                    epoch += 1;
+                    live = Some(false);
+                }
+            }
+            'C' => {
+                if live == Some(false) {
+                    subject
+                        .as_mut()
+                        .expect("{history:?}: live subject")
+                        .complete(epoch);
+                    live = Some(true);
+                    completed.insert(epoch, true);
+                }
+            }
+            'O' => {
+                if let Ok(obs) = space.observe(&0) {
+                    observations.push((epoch, obs));
+                }
+            }
+            'W' => {
+                if let Some((e, obs)) = observations.last() {
+                    let (waker, probe) = CountWake::waker();
+                    let is_pending = !completed.get(e).copied().unwrap_or(false);
+                    assert_eq!(
+                        !obs.register_waker(&waker),
+                        is_pending,
+                        "{history:?}: register_waker completion flag diverged for epoch {e}"
+                    );
+                    if is_pending {
+                        registered.push((*e, probe));
+                    }
+                }
+            }
+            'X' => {
+                if let Some(completed_now) = live.take() {
+                    completed.entry(epoch).or_insert(completed_now);
+                    subject = None;
+                }
+            }
+            'D' => {
+                observations.pop();
+            }
+            _ => unreachable!(),
+        }
+        // After every op: every observation resolves to its epoch's
+        // completion, exactly.
+        for (e, obs) in &observations {
+            let expected = completed.get(e).copied().unwrap_or(false).then_some(*e);
+            assert_eq!(
+                obs.try_get(),
+                expected,
+                "{history:?}: observation of epoch {e} diverged"
+            );
+        }
+    }
+
+    // Terminal: every registered waker fired exactly once iff its epoch
+    // completed.
+    for (e, probe) in &registered {
+        assert_eq!(
+            probe.count(),
+            usize::from(completed.get(e).copied().unwrap_or(false)),
+            "{history:?}: waker of epoch {e} fired {} times",
+            probe.count()
+        );
+    }
+}
+
+/// Exhaustive waker-drain histories (see `check_waker_history`).
+#[test]
+fn exhaustive_waker_drain_histories() {
+    enumerate_histories(&['R', 'C', 'O', 'W', 'X', 'D'], 6, check_waker_history);
+}
+
 /// Drop a space with pooled slots whose outcomes are probes: teardown must
 /// destroy every pooled outcome exactly once (pool drain path).
 #[test]

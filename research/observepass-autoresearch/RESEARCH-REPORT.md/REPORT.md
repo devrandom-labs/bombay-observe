@@ -350,3 +350,33 @@ Affected version under test: workspace commit baseline `cd35234`
   run is stated, not silent.
   Result: PASS (2 tests + 1 fuzz target + 1 loom model + Miri model 2/2
   at 4 cases).
+- Batch 15: (a) `tests/exhaustive.rs` —
+  `exhaustive_waker_drain_histories`: EVERY history over the alphabet
+  {register, complete, observe, register_waker, retire, drop-obs} to depth
+  6 (6^6 = 46,656 sequences), the strongest non-sampled coverage of the
+  register_waker/drain protocol. Per history: `register_waker`'s return
+  flag must match the generation's pending state; a successfully
+  registered waker fires EXACTLY ONCE iff its generation eventually
+  completes, never otherwise (including when the slot is pooled-and-reset
+  or consumed before completing); every observation resolves to its
+  captured epoch's completion after every op. PASS. Too large for Miri
+  (46,656 histories interpreted ≈ hours) — stated.
+  (b) `tests/pool.rs` — two waker-lifecycle tests (50 rounds each):
+  `pending_into_outcome_consumes_registered_waker_silently` — a waker
+  registered on a generation that never completes dies with the slot when
+  the last observation is consumed by `into_outcome` (None), never fired,
+  never leaked; `completed_into_outcome_fires_waker_then_moves_outcome` —
+  the drain fires the registered waker exactly once, then `into_outcome`
+  moves the outcome out: the take must not re-fire the waker and the
+  slot's final drop must not re-drop the moved value. PASS.
+  (c) `tests/stress.rs` — `stress_subject_exists_storm_pool_churn`: a
+  keeper holds key 2 while four threads hammer `subject(2)` (every attempt
+  pops a pooled slot and must restore it on `SubjectExists` — a leaked pop
+  would shrink the pool), concurrently a churner cycles 300 generations on
+  key 1 past the 128-slot cap with per-generation counted probes. Every
+  failed registration is exactly `SubjectExists`, and every completed
+  outcome is destroyed exactly once. PASS.
+  Miri on `--test pool`: 14/14 PASS in 471s interpreted — the waker
+  registry lifecycle (consumed-slot entry destruction, drain-then-take)
+  is clean under the interpreter.
+  Result: PASS (4 tests; score 150).

@@ -300,6 +300,70 @@ fn recycled_after_into_outcome_never_redrops() {
     );
 }
 
+/// A pending generation's waker registry dies with the last observation:
+/// `into_outcome` returning `None` (the generation never completed)
+/// consumes the slot, and a waker registered on it must never fire
+/// afterward — the entry is destroyed with the slot, not leaked.
+#[test]
+fn pending_into_outcome_consumes_registered_waker_silently() {
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let subject = space.subject(1).expect("first registration succeeds");
+        let obs = space.observe(&1).expect("subject retained");
+        let (waker, probe) = CountWake::waker();
+        assert!(!obs.register_waker(&waker), "pending: registration stored");
+        drop(subject); // retire without completing
+
+        assert_eq!(
+            obs.into_outcome(),
+            None,
+            "a pending generation has no outcome (round {round})"
+        );
+        // The observation, slot, and its waker entry are gone; nothing can
+        // fire the waker now (the subject is retired, the slot consumed).
+        assert_eq!(
+            probe.count(),
+            0,
+            "a consumed pending slot must never fire its wakers (round {round})"
+        );
+    }
+}
+
+/// The completed twin: `register_waker`, then `complete` — the drain fires
+/// the waker exactly once and empties the registry — then `into_outcome`
+/// moves the outcome out. The fire and the take are independent and both
+/// exact: the take must not re-fire the waker, and the slot's final drop
+/// must not re-drop the moved outcome.
+#[test]
+fn completed_into_outcome_fires_waker_then_moves_outcome() {
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+        let obs = space.observe(&1).expect("subject retained");
+        let (waker, probe) = CountWake::waker();
+        assert!(!obs.register_waker(&waker), "pending: registration stored");
+
+        subject.complete(round);
+        assert_eq!(
+            probe.count(),
+            1,
+            "the drain must fire the registered waker exactly once (round {round})"
+        );
+        drop(subject); // retired; the generation outlives via obs
+
+        assert_eq!(
+            obs.into_outcome(),
+            Some(round),
+            "into_outcome must move the completed outcome (round {round})"
+        );
+        assert_eq!(
+            probe.count(),
+            1,
+            "the take must not fire the waker again (round {round})"
+        );
+    }
+}
+
 /// Every waiter of a pooled-and-recycled slot's NEW generation is woken
 /// exactly once even when the slot saw heavy waiter traffic before.
 #[test]

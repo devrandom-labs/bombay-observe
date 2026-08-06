@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use observepass::ObservationSpace;
-use observepass_autoresearch::probe::{CountWake, ThreadWake};
+use observepass_autoresearch::probe::{CountWake, DropProbe, ThreadWake};
 
 /// SplitMix64: deterministic, seedable, dependency-free.
 struct Rng(u64);
@@ -471,4 +471,66 @@ fn stress_register_waker_racing_completion_no_lost_wake() {
         }
         waiter.join().expect("waiter panicked");
     }
+}
+
+/// SubjectExists storm under pool churn: a keeper holds key 2 permanently
+/// while four threads hammer `subject(2)` — every attempt pops a pooled
+/// slot and must restore it on `SubjectExists` (a leaked pop would shrink
+/// the pool). Concurrently a churner cycles 300 generations on key 1 (past
+/// the 128-slot pool cap), each completed with a uniquely counted probe.
+/// Every failed registration must return `SubjectExists` (never a win),
+/// and every completed outcome must be destroyed exactly once.
+#[test]
+fn stress_subject_exists_storm_pool_churn() {
+    const STORMERS: usize = 4;
+    const CHURN: u64 = 300;
+
+    let space = Arc::new(ObservationSpace::<u8, DropProbe>::new());
+    let counter = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // The keeper holds key 2 for the whole test; stormers can never win it.
+    let _keeper = space.subject(2).expect("keeper registers");
+
+    let stormers: Vec<_> = (0..STORMERS)
+        .map(|id| {
+            let space = Arc::clone(&space);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut conflicts = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    match space.subject(2) {
+                        Ok(_won) => panic!("stormer {id} won a key the keeper holds"),
+                        Err(_) => conflicts += 1,
+                    }
+                }
+                conflicts
+            })
+        })
+        .collect();
+
+    for round in 0..CHURN {
+        let mut subject = loop {
+            match space.subject(1) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        subject.complete(DropProbe::with_counter(round, &counter));
+        // drop(subject): retire; the pooled slot is recycled past the cap.
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    let conflicts: usize = stormers
+        .into_iter()
+        .map(|s| s.join().expect("stormer panicked"))
+        .sum();
+    assert!(conflicts > 0, "stormers never contended for the key");
+    drop(_keeper);
+    drop(space);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        CHURN as usize,
+        "completed outcomes must be destroyed exactly once under the storm"
+    );
 }
