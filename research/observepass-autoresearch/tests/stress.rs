@@ -203,7 +203,10 @@ fn stress_zero_timeout_boundary() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                for _ in 0..1_000 {
+                // Completion is guaranteed (the publisher completes before
+                // retiring), so loop until observed: a fixed iteration cap
+                // would make the test itself racy under scheduler load.
+                loop {
                     if let Some(outcome) = observation.wait_timeout(Duration::ZERO) {
                         assert_eq!(outcome, round, "zero-timeout returned a wrong outcome");
                         return true;
@@ -213,7 +216,6 @@ fn stress_zero_timeout_boundary() {
                         return true;
                     }
                 }
-                false
             })
         };
         barrier.wait();

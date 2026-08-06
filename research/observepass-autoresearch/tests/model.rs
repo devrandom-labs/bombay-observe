@@ -394,13 +394,69 @@ fn assert_completion_notifications(campaign: &Campaign, key: u8, epoch: u64, val
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-
     /// Random operation sequences conform to the independent model:
     /// registration conflicts, observation capture, completion visibility,
     /// exact wake counts, retirement isolation, and `into_outcome` rules.
+    /// Default 256 cases (proptest default); long campaign runs override
+    /// with PROPTEST_CASES (recorded in RESEARCH-REPORT.md).
     #[test]
     fn sequential_model_conformance(ops in prop::collection::vec(op_strategy(), 1..48)) {
         run_case(ops);
+    }
+}
+
+proptest! {
+    /// Shared-waker cancellation (the FINDING-001 topology) must never
+    /// lose the OUTCOME: futures on the same generation polled with one
+    /// shared waker, an arbitrary proper subset cancelled, then the
+    /// generation completes — every survivor must still resolve to the
+    /// exact published value when the executor re-polls it (the healing
+    /// path). Wake counts are intentionally NOT asserted here: the lost
+    /// wake itself is FINDING-001, preserved in `future_cancel.rs`; this
+    /// property fences off any deeper corruption (wrong value, stuck
+    /// pending, panic) in the same topology.
+    #[test]
+    fn shared_waker_cancellation_never_loses_outcome(
+        key in 0..3u8,
+        siblings in 2..5usize,
+        cancellations in 0..4usize,
+        rounds in 1..4u64,
+    ) {
+        let space = ObservationSpace::<u8, u64>::new();
+        let (shared_waker, _probe) = CountWake::waker();
+        let mut subject: Option<Subject<u8, u64>> = None;
+        for round in 0..rounds {
+            drop(subject.take()); // retire any previous generation
+            let mut s = space.subject(key).expect("retired above: must be registrable");
+            let value = round * 100 + u64::from(key) + 1;
+
+            let mut futures: Vec<Option<std::pin::Pin<Box<ObservationFuture<u64>>>>> = (0..siblings)
+                .map(|_| {
+                    let obs = space.observe(&key).expect("live generation");
+                    Some(Box::pin(obs.into_future()))
+                })
+                .collect();
+            for f in futures.iter_mut().flatten() {
+                assert!(
+                    poll_once(f.as_mut(), &shared_waker).is_pending(),
+                    "pending before completion"
+                );
+            }
+            // Cancel a proper subset (never all of them).
+            for f in futures.iter_mut().take(cancellations.min(siblings - 1)) {
+                *f = None; // cancel
+            }
+            s.complete(value);
+            subject = Some(s);
+
+            for f in futures.iter_mut().flatten() {
+                assert_eq!(
+                    poll_once(f.as_mut(), &shared_waker),
+                    std::task::Poll::Ready(value),
+                    "survivor failed to resolve after shared-waker cancellation"
+                );
+            }
+        }
+        drop(subject);
     }
 }

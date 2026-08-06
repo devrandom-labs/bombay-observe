@@ -242,3 +242,28 @@ Affected version under test: workspace commit baseline `cd35234`
   Subject thread migration (register/complete/retire on three different
   threads, waiter on a fourth, 100 rounds): exact outcome every round.
   Result: PASS (2 tests).
+- Batch 12 (loop continuation): `into_outcome` racing a concurrent handle
+  drop, 2,000 rounds with barrier release — the move succeeded at most
+  once per round, outcome dropped exactly once every round (PASS,
+  `tests/pool.rs`). New proptest property
+  `shared_waker_cancellation_never_loses_outcome` (FINDING-001 adjacent):
+  2-4 sibling futures on one generation polled with ONE shared waker, a
+  random proper subset cancelled, completion, re-poll — every survivor
+  resolves to the exact value, fencing off deeper corruption beyond the
+  documented lost wake (PASS; wake counts deliberately unasserted there).
+  FINDING-002 under loom: attempted and ABANDONED — `catch_unwind` around
+  a panicking waker inside the model aborts the process (panic across a
+  loom generator boundary, "panic in a destructor during cleanup",
+  SIGABRT); the native deterministic repro already demonstrates the
+  defect. Failed experiment recorded per repo rules. ASan fuzz: `ops`
+  target built with `--sanitizer address` (build-std via rust-src) and
+  run 6,251,835 executions in 121s, 1,347 corpus units, peak RSS 480MB —
+  NO CRASH, no sanitizer report. Long proptest campaign runs (env
+  override after dropping the hardcoded case cap, default stays the
+  proptest default 256): `PROPTEST_CASES=8192` both properties PASS;
+  `PROPTEST_CASES=1000000` both properties PASS in 33.6s release.
+  Harness fixes during the batch: `stress_zero_timeout_boundary` had a
+  racy fixed iteration cap (1,000 zero-timeout probes could exhaust
+  before the publisher ran under load — one flake observed, fixed to
+  loop-until-completion, which is guaranteed); two lint-level cleanups.
+  Result: PASS (1 test + 1 property added).

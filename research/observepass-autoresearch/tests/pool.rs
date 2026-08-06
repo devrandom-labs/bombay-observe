@@ -226,6 +226,55 @@ fn pool_overflow_with_live_observers_drops_exactly_once() {
     }
 }
 
+/// `into_outcome` racing a concurrent handle drop: two handles on a
+/// completed generation, one thread drops its handle while the other
+/// attempts the move. The move must succeed AT MOST once (never move out
+/// of a shared slot), and the outcome is destroyed exactly once either
+/// way — by the mover or by the slot's final drop.
+#[test]
+fn into_outcome_racing_handle_drop_moves_at_most_once() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    for round in 0..2_000_u64 {
+        let space = ObservationSpace::<u8, DropProbe>::new();
+        let (probe, counter) = DropProbe::new(round);
+        let mut subject = space.subject(1).expect("first registration succeeds");
+        subject.complete(probe);
+        let obs_a = space.observe(&1).expect("subject retained");
+        let obs_b = space.observe(&1).expect("subject retained");
+        drop(subject); // pinned by the two observations
+
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+        let dropper = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                drop(obs_a);
+            })
+        };
+        let mover = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                obs_b.into_outcome()
+            })
+        };
+        dropper.join().expect("dropper panicked");
+        let moved = mover.join().expect("mover panicked");
+        if let Some(outcome) = &moved {
+            assert_eq!(outcome.tag, round, "moved outcome carries its value");
+        }
+        drop(space);
+        drop(moved);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "round {round}: outcome dropped != once across the race"
+        );
+    }
+}
+
 /// A moved-out outcome whose slot is later recycled (the moving handle was
 /// the last reference, so the slot is pooled on retire... the move happens
 /// BEFORE retire) must not be re-dropped by `reset`.
