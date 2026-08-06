@@ -53,12 +53,23 @@ fn stress_publishers_observers_value_integrity() {
 
     let space = Arc::new(ObservationSpace::<u64, u64>::new());
     let barrier = Arc::new(Barrier::new((PUBLISHERS + OBSERVERS + 1) as usize));
-    let stop = Arc::new(AtomicBool::new(false));
+    // Seed a completed generation on key 2 — outside the publishers'
+    // keyspace (KEYS = 2) and retained for the whole run — so every
+    // observer has a GUARANTEED first read. Without the seed, observers
+    // can be descheduled for the entire publisher window (observed:
+    // captures=0 for all four) and the run reads nothing; no scheduling
+    // gate can close that window.
+    let mut seed = space.subject(2).expect("seed registers");
+    seed.complete(u64::MAX); // distinctive: publishers never emit 0xFF_..
+    // Set by each publisher after its last round: bounds the observers'
+    // loop by the publishers' actual runtime.
+    let done = Arc::new(AtomicBool::new(false));
 
     let publishers: Vec<_> = (0..PUBLISHERS)
         .map(|id| {
             let space = Arc::clone(&space);
             let barrier = Arc::clone(&barrier);
+            let done = Arc::clone(&done);
             thread::spawn(move || {
                 let mut rng = Rng(0xA11C_E000 + id);
                 barrier.wait();
@@ -68,6 +79,7 @@ fn stress_publishers_observers_value_integrity() {
                         subject.complete(encode(id, round, key));
                     } // Err: contention, another publisher holds the key
                 }
+                done.store(true, Ordering::SeqCst);
             })
         })
         .collect();
@@ -76,15 +88,24 @@ fn stress_publishers_observers_value_integrity() {
         .map(|id| {
             let space = Arc::clone(&space);
             let barrier = Arc::clone(&barrier);
-            let stop = Arc::clone(&stop);
+            let done = Arc::clone(&done);
             thread::spawn(move || {
                 let mut rng = Rng(0x0B5E_7000 + id);
                 barrier.wait();
                 let mut reads = 0_u64;
-                for _ in 0..ROUNDS {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
+                // Guaranteed first read: the completed seed on key 2 is
+                // retained for the whole run, so this resolves immediately
+                // regardless of scheduling.
+                assert_eq!(
+                    space.observe(&2).expect("seed retained").wait(),
+                    u64::MAX,
+                    "seed generation must resolve to its value"
+                );
+                reads += 1;
+                // Loop until both publishers finish: every registered
+                // generation completes before its publisher retires, so the
+                // blocking `wait` arm below is guaranteed to return.
+                while !done.load(Ordering::Relaxed) {
                     let key = rng.below(KEYS);
                     let Ok(observation) = space.observe(&key) else {
                         continue; // vacant under contention: fine

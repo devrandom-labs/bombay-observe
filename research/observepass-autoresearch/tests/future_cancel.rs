@@ -160,6 +160,31 @@ fn cancel_after_completion_is_unobservable() {
     drop(f);
 }
 
+/// A future polled with MANY distinct wakers (a pathological executor
+/// rotating wakers every poll) must register each one, fire every one
+/// exactly once at completion, and deregister every one on drop.
+#[test]
+fn many_distinct_wakers_fire_exactly_once_and_deregister() {
+    const POLLS: usize = 50;
+    let space = ObservationSpace::<u32, u64>::new();
+    let mut subject = space.subject(31).expect("first registration succeeds");
+
+    let obs = space.observe(&31).expect("subject retained");
+    let mut f = Box::pin(obs.into_future());
+    let mut probes = Vec::new();
+    for _ in 0..POLLS {
+        let (waker, probe) = CountWake::waker();
+        assert!(poll_once(f.as_mut(), &waker).is_pending());
+        probes.push(probe);
+    }
+    subject.complete(99);
+    for (i, probe) in probes.iter().enumerate() {
+        assert_eq!(probe.count(), 1, "waker {i} fired != once");
+    }
+    assert_eq!(poll_once(f.as_mut(), &CountWake::waker().0), Poll::Ready(99));
+    drop(f);
+}
+
 /// FINDING-001 adjacent through the public `register_waker` API: a direct
 /// waker registration has no owning future at all, yet a future sharing the
 /// waker removes it on drop. The direct registrant is never woken.

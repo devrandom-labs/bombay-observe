@@ -101,6 +101,46 @@ fn into_outcome_pending_yields_nothing() {
     assert_eq!(second.try_get(), Some(66));
 }
 
+/// A zero timeout on a completed observation returns the outcome
+/// immediately — the deadline is never consulted once the outcome is
+/// published.
+#[test]
+fn wait_timeout_zero_on_completed_returns_outcome() {
+    let space = ObservationSpace::<u8, u8>::new();
+    let mut subject = space.subject(4).expect("first registration succeeds");
+    subject.complete(41);
+    let observation = space.observe(&4).expect("subject retained");
+    assert_eq!(observation.wait_timeout(Duration::ZERO), Some(41));
+}
+
+/// `register_waker` on a completed-and-RETIRED observation returns `true`
+/// (already published) without registering: the slot keeps its COMPLETED
+/// bit across retirement while any observation pins it.
+#[test]
+fn register_waker_true_on_retired_completed() {
+    let space = ObservationSpace::<u8, u8>::new();
+    let mut subject = space.subject(4).expect("first registration succeeds");
+    subject.complete(42);
+    let observation = space.observe(&4).expect("completed generation observable");
+    drop(subject); // retire; the observation pins the completed slot
+    let (waker, probe) = observepass_autoresearch::probe::CountWake::waker();
+    assert!(observation.register_waker(&waker), "completed: nothing registered");
+    assert_eq!(observation.try_get(), Some(42));
+    assert_eq!(probe.count(), 0, "no registration, no wake");
+}
+
+/// A blocking `wait` on an already-completed observation returns
+/// immediately, and can be repeated: waiting is idempotent on completion.
+#[test]
+fn wait_twice_on_completed_returns_immediately() {
+    let space = ObservationSpace::<u8, u8>::new();
+    let mut subject = space.subject(4).expect("first registration succeeds");
+    subject.complete(43);
+    let observation = space.observe(&4).expect("subject retained");
+    assert_eq!(observation.wait(), 43);
+    assert_eq!(observation.wait(), 43);
+}
+
 /// Cloning the space shares the namespace: conflicts, observations, and
 /// completions are visible across clones, and dropping one clone changes
 /// nothing.

@@ -437,3 +437,36 @@ Affected version under test: workspace commit baseline `cd35234`
   pool.rs's `uncompleted_generation_recycles_without_fabricating`. PASS.
   Stress suite re-run 3x, no flakes.
   Result: PASS (3 tests; score 170).
+- Batch 18: four contract/cancellation tests plus a real harness-flake fix
+  in `stress_publishers_observers_value_integrity` (root cause found and
+  eliminated, not papered over):
+  (a) `tests/contract.rs` — `wait_timeout_zero_on_completed_returns_outcome`
+  (zero timeout on a completed observation resolves immediately),
+  `register_waker_true_on_retired_completed` (a completed-and-retired
+  generation's slot keeps COMPLETED while pinned: `register_waker`
+  returns true, registers nothing, never fires), and
+  `wait_twice_on_completed_returns_immediately` (blocking wait is
+  idempotent on completion). PASS.
+  (b) `tests/future_cancel.rs` — `many_distinct_wakers_fire_exactly_once_and_deregister`:
+  50 distinct wakers across 50 polls of one future; each fires exactly
+  once at completion and the future resolves. PASS.
+  (c) FLAKE FIX: `stress_publishers_observers_value_integrity` failed
+  intermittently (~1 in 6 to 5 in 15 runs under the parallel suite) with
+  `stress run observed no completions at all` — all four observers read
+  nothing. Root cause (empirically pinned with per-observer counters:
+  `reads=0 captures=0` for all observers): the barrier releases
+  publishers and observers together, but observers can be descheduled for
+  the ENTIRE publisher window — they wake after both publishers finished,
+  all keys retired-vacant, and every `observe` misses; a fixed 2000-
+  iteration cap then exits with 0 reads. Intermediate fixes that did NOT
+  work, each recorded: (i) loop-until-first-read (unbounded — spins
+  forever once the keys are permanently vacant after the publishers
+  finish); (ii) a `started` gate (publishers spin until observers are in
+  their loops — narrowed the window but observers could still be
+  descheduled between the gate increment and their first observe,
+  captures=0 again). ELIMINATED FIX: seed a completed generation on key 2
+  (outside the publishers' 2-key keyspace), retained for the whole run;
+  every observer's first action is `observe(&2).wait()` — a guaranteed
+  read independent of scheduling. 20/20 suite runs clean. The canary
+  remains as a belt-and-suspenders guard (reads >= 4 by construction).
+  Result: PASS (4 tests; score 174).
