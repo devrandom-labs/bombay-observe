@@ -89,3 +89,14 @@ Affected version under test: workspace commit baseline `cd35234`
   PASS. Two model bugs found and fixed during development (subject-side
   refcount is 2 — map entry + Subject handle; exclusivity test must run
   after handle removal against 0 remaining refs) — not product defects.
+- Batch 4 (`tests/exhaustive.rs`): exhaustive small-state exploration, no
+  sampling. All single-key histories to depth 5 over the 5-op alphabet
+  {register, complete, observe, retire, drop-obs} (3,125 sequences) and to
+  depth 7 over the reduced 4-op alphabet (16,384 sequences), checked
+  against a minimal model after EVERY op. All 6 drop-order permutations of
+  {subject, observation, future} x {completed, pending} for exact drop and
+  wake counts. All retirement subsets of 3 keys across the inline->hash
+  promotion boundary (INLINE_CAP=4, 6 keys) with re-registration; all
+  ordered double-retirement pairs; all poll-count/completion/cancellation
+  orderings for futures. Result: PASS (6 tests, ~19.5k histories + all
+  permutations).
