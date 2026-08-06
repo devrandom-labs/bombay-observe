@@ -129,3 +129,26 @@ Affected version under test: workspace commit baseline `cd35234`
   loom_external`. One test bug fixed during development (vacancy window
   between retire and re-register not modelled) — not a product defect.
   Result: PASS.
+- Batch 7 (Miri, ownership/memory validity): `nix develop .#miri --command
+  cargo miri test --manifest-path
+  research/observepass-autoresearch/Cargo.toml --test pool` — all 11
+  pool/drop-count tests PASS under Miri 0.1.0 (nightly 2026-08-04),
+  27.3s interpreted. No UB in the UnsafeCell outcome protocol, raw
+  waiters-pointer reclamation, Arc-based slot recycling, or
+  `into_outcome` move. `--test future_cancel`: PASS. `--test exhaustive`:
+  one test reported FAILED after 2,947.94s interpreted (5 passed, 1
+  failed); the failing test and error are being isolated — see follow-up
+  log entries.
+- Batch 8 (coverage-guided fuzzing): cargo-fuzz 0.13.2 (nixpkgs) +
+  libfuzzer-sys 0.4.13, `--sanitizer none`, nightly 2026-07-29 toolchain.
+  Two targets under `fuzz/fuzz_targets/`: `ops` (sequential op
+  interpreter, (epoch,key)-tagged value integrity, 4 keys, ≤256 ops per
+  input) and `future_ops` (future/poll/migrate/cancel sequences with
+  exact wake-count and cancelled-waker-silence assertions, 2 keys, ≤128
+  ops). Runs: `ops` 10,663,376 executions in 91s (3,946 corpus units,
+  peak RSS 28MB) — NO CRASH. `future_ops` 12,207,925 executions in 91s
+  (2,338 corpus units, peak RSS 28MB) — NO CRASH. One fuzz-target bug
+  found and fixed during bring-up (`chunks(2)` trailing-byte panic in the
+  harness, input `[10]`) — not a product defect. The shared-waker
+  topology is deliberately excluded from `future_ops` (FINDING-001,
+  preserved separately). Corpus not committed (regenerable; 4.3MB).

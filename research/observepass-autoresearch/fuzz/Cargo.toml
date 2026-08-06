@@ -1,0 +1,27 @@
+[package]
+name = "observepass-autoresearch-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+observepass = { path = "../../../crates/observepass" }
+observepass-autoresearch = { path = ".." }
+
+[[bin]]
+name = "ops"
+path = "fuzz_targets/ops.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "future_ops"
+path = "fuzz_targets/future_ops.rs"
+test = false
+doc = false
