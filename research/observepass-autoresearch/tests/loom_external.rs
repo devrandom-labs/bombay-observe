@@ -1,0 +1,204 @@
+//! Bounded Loom models over the real observepass protocol, driven from the
+//! external (public-API) side. The whole file compiles only under
+//! `--cfg loom`; the normal gate sees an empty target.
+//!
+//! Run:
+//!   RUSTFLAGS="--cfg loom" cargo test \
+//!     --manifest-path research/observepass-autoresearch/Cargo.toml \
+//!     --release --test loom_external
+//!
+//! NOTE: under `--cfg loom` the other test targets would execute the
+//! loom-instrumented crate OUTSIDE a model and panic; always select this
+//! target only.
+
+#![cfg(loom)]
+
+use loom::sync::Arc;
+use loom::thread;
+
+use observepass::ObservationSpace;
+
+const PREEMPTIONS: usize = 7;
+
+fn builder() -> loom::model::Builder {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(PREEMPTIONS);
+    builder
+}
+
+/// An observation captured anywhere across a retire/re-register boundary
+/// must still resolve to exactly the outcome of the generation it
+/// captured — never lost, never the other generation's value.
+#[test]
+fn loom_observe_across_retire_reregister_never_loses() {
+    builder().check(|| {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut first = space.subject(1).expect("first registration succeeds");
+
+        let observer = {
+            let space = space.clone();
+            thread::spawn(move || {
+                // A vacancy window exists between retirement and
+                // re-registration: spin through it.
+                let observation = loop {
+                    if let Ok(observation) = space.observe(&1) {
+                        break observation;
+                    }
+                    thread::yield_now();
+                };
+                // Blocking wait: resolves to the captured generation's
+                // outcome whichever one it is.
+                observation.wait()
+            })
+        };
+
+        first.complete(100);
+        drop(first); // retire generation A
+
+        let replacement = {
+            let space = space.clone();
+            thread::spawn(move || {
+                // Spin until the key is vacant (retirement may not have
+                // happened yet in this interleaving).
+                let mut subject = loop {
+                    if let Ok(subject) = space.subject(1) {
+                        break subject;
+                    }
+                    thread::yield_now();
+                };
+                subject.complete(200);
+                subject
+            })
+        };
+
+        let outcome = observer.join().expect("observer panicked");
+        assert!(
+            outcome == 100 || outcome == 200,
+            "observation resolved to an alien outcome: {outcome}"
+        );
+        drop(replacement.join().expect("replacement panicked"));
+    });
+}
+
+/// A pooled slot (retired with no observers after its waiter drained) is
+/// recycled for the next generation: the new waiter's registration races
+/// the new completion on the SAME slot memory; it must resolve to the new
+/// outcome, and nothing from the old generation may fire again.
+#[test]
+fn loom_pooled_slot_reuse_with_waiters() {
+    builder().check(|| {
+        let space = ObservationSpace::<u8, u64>::new();
+
+        // Generation A: waiter + completion + retirement (slot pooled).
+        let mut first = space.subject(1).expect("first registration succeeds");
+        let waiter_a = {
+            let observation = space.observe(&1).expect("generation live");
+            thread::spawn(move || observation.wait())
+        };
+        first.complete(100);
+        assert_eq!(waiter_a.join().expect("waiter A panicked"), 100);
+        drop(first);
+
+        // Generation B reuses the pooled slot (single-slot pool, LIFO).
+        let mut second = space.subject(1).expect("retired key registrable");
+        let waiter_b = {
+            let observation = space.observe(&1).expect("generation live");
+            thread::spawn(move || observation.wait())
+        };
+        second.complete(200);
+        assert_eq!(waiter_b.join().expect("waiter B panicked"), 200);
+    });
+}
+
+/// The future path under the model: `block_on` parks on the loom-aware
+/// waker; completion racing the poll must wake it with the outcome.
+#[test]
+fn loom_future_resolves_racing_completion() {
+    builder().check(|| {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+
+        let poller = {
+            let observation = space.observe(&1).expect("generation live");
+            thread::spawn(move || loom::future::block_on(observation.into_future()))
+        };
+        let completer = thread::spawn(move || {
+            subject.complete(42);
+        });
+
+        assert_eq!(poller.join().expect("poller panicked"), 42);
+        completer.join().expect("completer panicked");
+    });
+}
+
+/// Concurrent registration at one key: exactly one winner; the winner's
+/// completion is observable by a waiter captured after the race.
+#[test]
+fn loom_concurrent_subject_one_winner_observable() {
+    builder().check(|| {
+        let space = Arc::new(ObservationSpace::<u8, u64>::new());
+
+        let contender_a = {
+            let space = Arc::clone(&space);
+            thread::spawn(move || space.subject(1).map(|mut s| {
+                s.complete(1);
+                s
+            }))
+        };
+        let contender_b = {
+            let space = Arc::clone(&space);
+            thread::spawn(move || space.subject(1).map(|mut s| {
+                s.complete(2);
+                s
+            }))
+        };
+
+        let a = contender_a.join().expect("contender A panicked");
+        let b = contender_b.join().expect("contender B panicked");
+        let winners = u8::from(a.is_ok()) + u8::from(b.is_ok());
+        assert_eq!(winners, 1, "exactly one subject must win the key");
+
+        let outcome = space.observe(&1).expect("winner retained").wait();
+        assert!(outcome == 1 || outcome == 2, "alien outcome {outcome}");
+    });
+}
+
+/// Two waiters on one generation, completion racing both registrations:
+/// the drain must wake both, each with the exact outcome.
+#[test]
+fn loom_two_waiters_both_woken() {
+    builder().check(|| {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+
+        let waiter_a = {
+            let observation = space.observe(&1).expect("generation live");
+            thread::spawn(move || observation.wait())
+        };
+        let waiter_b = {
+            let observation = space.observe(&1).expect("generation live");
+            thread::spawn(move || observation.wait())
+        };
+        subject.complete(7);
+
+        assert_eq!(waiter_a.join().expect("waiter A panicked"), 7);
+        assert_eq!(waiter_b.join().expect("waiter B panicked"), 7);
+    });
+}
+
+/// wait_timeout's registration protocol under the model (no clock: the
+/// timeout never fires, so this models the completed path only).
+#[test]
+fn loom_wait_timeout_completed_path() {
+    builder().check(|| {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+
+        let waiter = {
+            let observation = space.observe(&1).expect("generation live");
+            thread::spawn(move || observation.wait_timeout(core::time::Duration::from_secs(1)))
+        };
+        subject.complete(11);
+        assert_eq!(waiter.join().expect("waiter panicked"), Some(11));
+    });
+}

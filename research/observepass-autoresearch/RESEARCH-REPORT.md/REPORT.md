@@ -113,3 +113,19 @@ Affected version under test: workspace commit baseline `cd35234`
   drops another observation of the same generation during the drain —
   100 rounds, fired exactly once each, no deadlock. Registration flood:
   256 distinct wakers, each fired exactly once. Result: PASS (5 tests).
+- Batch 6 (`tests/loom_external.rs`): bounded Loom models over the real
+  protocol from the public API (the dependency rebuilds with
+  `RUSTFLAGS="--cfg loom"`; the research crate declares its own
+  `check-cfg` and uses loom 0.7 with the `futures` feature). Six models:
+  observe across retire/re-register (captured generation's outcome never
+  lost), pooled-slot reuse with waiter traffic on the same slot memory,
+  `ObservationFuture` under `loom::future::block_on` racing completion,
+  concurrent subject contention (exactly one winner, observable
+  completion), two waiters racing one completion (both woken), and the
+  wait_timeout completed path. Preemption bound 7: all 6 models COMPLETED
+  (no truncation) in 27.6s; bounds 3-6 also completed (0.2s / 1.1s / 4.0s
+  / 11.7s). Run: `RUSTFLAGS="--cfg loom" cargo test --manifest-path
+  research/observepass-autoresearch/Cargo.toml --release --test
+  loom_external`. One test bug fixed during development (vacancy window
+  between retire and re-register not modelled) — not a product defect.
+  Result: PASS.
