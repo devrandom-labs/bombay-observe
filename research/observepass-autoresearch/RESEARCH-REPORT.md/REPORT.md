@@ -197,10 +197,12 @@ Affected version under test: workspace commit baseline `cd35234`
   `src/probe.rs` now uses a hand-rolled `RawWaker` with a single static
   vtable (identical behavior natively, Miri-reliable `will_wake`);
   targeted Miri rerun of the failing test: PASS. Full-suite Miri
-  confirmation and `panic_safety`/`contract` Miri runs: see follow-up
-  entries. `model` (proptest) and `stress` (1,600+ spawned threads) are
-  excluded from Miri as impractically slow under interpretation — stated
-  honestly, not skipped silently.
+  confirmation: `--test exhaustive` all 6 PASS (3,020.20s interpreted,
+  Miri 0.1.0 nightly 2026-08-04). `--test panic_safety` (2 active) and
+  `--test contract` (8) PASS under Miri (0.90s / 1.35s). `model`
+  (proptest) and `stress` (1,600+ spawned threads) are excluded from Miri
+  as impractically slow under interpretation — stated honestly, not
+  skipped silently.
 - Batch 8 (coverage-guided fuzzing): cargo-fuzz 0.13.2 (nixpkgs) +
   libfuzzer-sys 0.4.13, `--sanitizer none`, nightly 2026-07-29 toolchain.
   Two targets under `fuzz/fuzz_targets/`: `ops` (sequential op
