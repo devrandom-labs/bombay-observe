@@ -536,3 +536,10 @@ Affected version under test: workspace commit baseline `cd35234`
   resolves to the exact outcome, and a second waiter on the same
   generation still resolves exactly once (100 rounds). PASS. Full-harness
   stability sweep after the flake fixes: 5/5 gate runs green (score 179).
+- Batch 25: the reentrancy family completed — `stress_wait_timeout_inside_wake_during_drain`
+  (an in-drain `wait_timeout` resolves Some immediately, never parks the
+  completing thread; 50 rounds) and
+  `stress_into_outcome_inside_wake_during_drain_refused` (an in-drain
+  `into_outcome` is refused — the waker's own observation keeps the slot
+  shared — and the outcome stays readable; 50 rounds). Full-harness
+  3/3 green. PASS (score 181).

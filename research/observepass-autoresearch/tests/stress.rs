@@ -877,6 +877,108 @@ fn stress_wait_inside_wake_during_drain() {
     }
 }
 
+/// A waker whose `wake` calls `wait_timeout` on the same generation during
+/// the drain: COMPLETED is set before the drain, so it returns Some
+/// immediately (the completing thread never parks), and the drain still
+/// resolves every other waiter exactly once.
+#[test]
+fn stress_wait_timeout_inside_wake_during_drain() {
+    use std::task::Wake;
+
+    struct TimeoutInWake {
+        obs: std::sync::Mutex<Option<observepass::Observation<u64>>>,
+        fires: AtomicUsize,
+        value: std::sync::Mutex<Option<Option<u64>>>,
+    }
+
+    impl Wake for TimeoutInWake {
+        fn wake(self: Arc<Self>) {
+            self.fires.fetch_add(1, Ordering::SeqCst);
+            let guard = self.obs.lock().expect("obs lock");
+            if let Some(obs) = guard.as_ref() {
+                *self.value.lock().expect("value lock") =
+                    Some(obs.wait_timeout(Duration::from_secs(5)));
+            }
+        }
+    }
+
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+        let waker_obs = space.observe(&1).expect("subject retained");
+        let wait_obs = space.observe(&1).expect("subject retained");
+        let reentrant = Arc::new(TimeoutInWake {
+            obs: std::sync::Mutex::new(Some(waker_obs)),
+            fires: AtomicUsize::new(0),
+            value: std::sync::Mutex::new(None),
+        });
+        assert!(!wait_obs.register_waker(&std::task::Waker::from(reentrant.clone())));
+        subject.complete(round);
+        assert_eq!(
+            reentrant.fires.load(Ordering::SeqCst),
+            1,
+            "reentrant waker fired != once (round {round})"
+        );
+        assert_eq!(
+            *reentrant.value.lock().expect("value lock"),
+            Some(Some(round)),
+            "the in-drain wait_timeout must resolve to the exact outcome (round {round})"
+        );
+        assert_eq!(wait_obs.try_get(), Some(round));
+    }
+}
+
+/// `into_outcome` from within a waker during the drain is refused: the
+/// waker's own observation keeps the slot shared, so the exclusive take
+/// must return None and leave the outcome readable.
+#[test]
+fn stress_into_outcome_inside_wake_during_drain_refused() {
+    use std::task::Wake;
+
+    struct TakeInWake {
+        obs: std::sync::Mutex<Option<observepass::Observation<u64>>>,
+        fires: AtomicUsize,
+        taken: std::sync::Mutex<Option<Option<u64>>>,
+    }
+
+    impl Wake for TakeInWake {
+        fn wake(self: Arc<Self>) {
+            self.fires.fetch_add(1, Ordering::SeqCst);
+            // Consume the waker's own observation (into_outcome takes self).
+            if let Some(obs) = self.obs.lock().expect("obs lock").take() {
+                // The subject still lives (this waker is registered on it),
+                // so the slot is shared: the take must be refused.
+                *self.taken.lock().expect("taken lock") = Some(obs.into_outcome());
+            }
+        }
+    }
+
+    for round in 0..50_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+        let taker_obs = space.observe(&1).expect("subject retained");
+        let waker_obs = space.observe(&1).expect("subject retained");
+        let reentrant = Arc::new(TakeInWake {
+            obs: std::sync::Mutex::new(Some(waker_obs)),
+            fires: AtomicUsize::new(0),
+            taken: std::sync::Mutex::new(None),
+        });
+        assert!(!taker_obs.register_waker(&std::task::Waker::from(reentrant.clone())));
+        subject.complete(round);
+        assert_eq!(
+            reentrant.fires.load(Ordering::SeqCst),
+            1,
+            "reentrant waker fired != once (round {round})"
+        );
+        assert_eq!(
+            *reentrant.taken.lock().expect("taken lock"),
+            Some(None),
+            "the in-drain take must be refused while the slot is shared (round {round})"
+        );
+        assert_eq!(taker_obs.try_get(), Some(round), "outcome stays readable");
+    }
+}
+
 /// Pinned retired-pending generations never fabricate: observations
 /// captured on generations that are retired WITHOUT completing must time
 /// out forever (never resolve to a value), even while other generations on
