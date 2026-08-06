@@ -160,6 +160,31 @@ fn cancel_after_completion_is_unobservable() {
     drop(f);
 }
 
+/// FINDING-001 adjacent through the public `register_waker` API: a direct
+/// waker registration has no owning future at all, yet a future sharing the
+/// waker removes it on drop. The direct registrant is never woken.
+#[test]
+#[ignore = "FINDING-001 variant: future drop deregisters an ownerless register_waker registration sharing its waker; 0 wakes at completion"]
+fn cancelled_future_steals_direct_waker_registration() {
+    let space = ObservationSpace::<u32, u64>::new();
+    let mut subject = space.subject(41).expect("first registration succeeds");
+    let obs1 = space.observe(&41).expect("subject retained");
+    let obs2 = space.observe(&41).expect("subject retained");
+    let (waker, probe) = CountWake::waker();
+
+    assert!(!obs1.register_waker(&waker), "pending: registration stored");
+    let mut f2 = Box::pin(obs2.into_future());
+    assert!(poll_once(f2.as_mut(), &waker).is_pending());
+    drop(f2);
+
+    subject.complete(43);
+    assert!(
+        probe.count() >= 1,
+        "the direct registration must fire at completion; got {} wakes",
+        probe.count()
+    );
+}
+
 /// A re-polled survivor heals itself: after the sibling's cancellation, if
 /// the executor re-polls the survivor for any reason before completion, the
 /// registration must be restored and completion must wake it.

@@ -64,5 +64,14 @@ Affected version under test: workspace commit baseline `cd35234`
   the real count. Accommodation of the frozen parser only; content is
   unchanged and complete.
 - Batch 1 (`tests/future_cancel.rs`): 8 cancellation/waker tests, 6 active
-  passing, 2 ignored as FINDING-001 (minimal + 3-future variant).
+  passing, 3 ignored as FINDING-001 (minimal + 3-future variant +
+  ownerless `register_waker` variant).
   Deterministic, single-threaded, `CountWake` instrumentation.
+- Batch 2 (`tests/pool.rs`): 11 pooled-slot/drop-count tests, all active
+  passing. 300-generation churn past the 128-slot pool cap with
+  per-generation drop counters (exactly-once destruction), deterministic
+  LIFO slot reuse (no COMPLETED/outcome leakage), stale-waiter recycling,
+  cross-key reuse, orphan observation pinning, `into_outcome` drop
+  ownership transfer, waiter traffic across 8 recycle rounds. One test bug
+  found and fixed during development (`try_get` clones the probe;
+  accounting corrected) — not a product defect.
