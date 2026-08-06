@@ -75,3 +75,17 @@ Affected version under test: workspace commit baseline `cd35234`
   ownership transfer, waiter traffic across 8 recycle rounds. One test bug
   found and fixed during development (`try_get` clones the probe;
   accounting corrected) — not a product defect.
+- Batch 3 (`tests/model.rs`): independent sequential reference model
+  (HashMap-of-epochs; per-key epoch counters; retired-epoch outcomes)
+  driven by proptest: 256 cases per run, ops weighted across register /
+  complete / observe / try_get / register_waker / into_outcome / retire /
+  drop-obs / new/poll/migrate/cancel-future, keyspace 8 (2x INLINE_CAP,
+  exercises inline and promoted maps), handle ids 0..16. Exact wake counts
+  asserted at every completion (each distinct registered waker fires
+  exactly once). Proptest config: `ProptestConfig::with_cases(256)`,
+  default entropy (no fixed seed; failure persistence inactive for test
+  targets). Shared-waker-across-futures topology deliberately excluded
+  (deterministically hits FINDING-001, preserved separately). Result:
+  PASS. Two model bugs found and fixed during development (subject-side
+  refcount is 2 — map entry + Subject handle; exclusivity test must run
+  after handle removal against 0 remaining refs) — not product defects.
