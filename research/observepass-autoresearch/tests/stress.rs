@@ -519,7 +519,12 @@ fn stress_subject_exists_storm_pool_churn() {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 let mut conflicts = 0usize;
-                while !stop.load(Ordering::SeqCst) {
+                // A minimum-attempts floor guarantees the storm actually
+                // ran: without it, a stormer descheduled until after `stop`
+                // is set exits with 0 attempts (the topology-A flake class,
+                // Batch 18). 1000 SubjectExists attempts are structurally
+                // guaranteed by the keeper holding key 2 for the whole test.
+                while !stop.load(Ordering::SeqCst) || conflicts < 1000 {
                     match space.subject(2) {
                         Ok(_won) => panic!("stormer {id} won a key the keeper holds"),
                         Err(_) => conflicts += 1,
@@ -727,6 +732,80 @@ fn stress_same_key_contention_exactly_one_winner() {
         );
         // The winner's subject dropped when its contender thread ended:
         // the key is vacant for the next round.
+    }
+}
+
+/// The `wait()` re-registration dedup path, pinned deterministically:
+/// thread A registers, thread B registers (so A's entry is NOT last),
+/// A is spuriously woken and re-registers — the `waiters.last()` dedup
+/// check misses and A accumulates a second entry. The drain then fires
+/// A twice (two unpark tokens) and B once. A consumes one token and
+/// returns; the second token is queued for A's NEXT park — a stale token
+/// that must not corrupt a later wait: the next generation's wait still
+/// resolves exactly (the stale token only causes one spurious park, and
+/// the loop's recheck heals it).
+#[test]
+fn stress_duplicate_waiter_entry_stale_token_self_heals() {
+    const ROUNDS: u64 = 50;
+
+    let space = Arc::new(ObservationSpace::<u8, u64>::new());
+    for round in 0..ROUNDS {
+        let key = (round % 2) as u8;
+        let mut subject = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let handle_a = {
+            let obs = space.observe(&key).expect("live generation");
+            thread::spawn(move || obs.wait_timeout(Duration::from_secs(5)))
+        };
+        let handle_b = {
+            let obs = space.observe(&key).expect("live generation");
+            thread::spawn(move || obs.wait_timeout(Duration::from_secs(5)))
+        };
+        // Let both register (A then B), so A's entry is not last.
+        thread::sleep(Duration::from_millis(10));
+        handle_a.thread().unpark(); // spurious wake for A
+        thread::sleep(Duration::from_millis(10)); // A re-registers (dup entry)
+        subject.complete(round);
+
+        assert_eq!(
+            handle_a.join().expect("waiter A panicked"),
+            Some(round),
+            "A must resolve despite its duplicate entry (round {round})"
+        );
+        assert_eq!(
+            handle_b.join().expect("waiter B panicked"),
+            Some(round),
+            "B must resolve exactly once (round {round})"
+        );
+        // The waiter threads consumed their observations; the generation
+        // can retire.
+        drop(subject); // retire
+
+        // Phase 2: A's stale token (from the duplicate entry's unpark) is
+        // queued. A new generation's wait must still resolve exactly: the
+        // stale token causes at most one spurious park, which the loop's
+        // recheck heals.
+        let mut subject2 = loop {
+            match space.subject(key) {
+                Ok(subject) => break subject,
+                Err(_) => thread::yield_now(),
+            }
+        };
+        let handle_a2 = {
+            let obs = space.observe(&key).expect("live generation");
+            thread::spawn(move || obs.wait_timeout(Duration::from_secs(5)))
+        };
+        thread::sleep(Duration::from_millis(10));
+        subject2.complete(round + 100);
+        assert_eq!(
+            handle_a2.join().expect("waiter A2 panicked"),
+            Some(round + 100),
+            "a stale unpark token must not corrupt the next generation's wait (round {round})"
+        );
     }
 }
 

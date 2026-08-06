@@ -513,3 +513,19 @@ Affected version under test: workspace commit baseline `cd35234`
   `drop_outcome` COMPLETED/OUTCOME_VALID gating, the CAS-init waiters
   registry with loser-reclaim, Arc-based reclamation) — matches the
   documented invariants; no new seam. Result: PASS (depth-only).
+- Batch 23: `stress_duplicate_waiter_entry_stale_token_self_heals` — the
+  `wait()` re-registration dedup path pinned DETERMINISTICALLY (previously
+  only stress-tested at scale via spurious-unpark injection): thread A
+  registers, thread B registers (A's entry is NOT last), A is spuriously
+  woken and re-registers — the `waiters.last()` dedup check misses and A
+  accumulates a second entry. The drain fires A twice (two unpark tokens)
+  and B once; A consumes one and returns. The queued second token must
+  not corrupt the NEXT generation's wait: phase 2 waits on a fresh
+  generation and still resolves exactly (the stale token causes at most
+  one spurious park; the loop's recheck heals it). 50 rounds, 5x suite
+  re-runs stable. Also fixed a second instance of the topology-A flake
+  class: `stress_subject_exists_storm_pool_churn`'s stormers could be
+  descheduled until after `stop` was set and exit with 0 attempts
+  ("stormers never contended") — a per-stormer 1000-attempts floor (the
+  keeper guarantees every attempt conflicts) makes the canary
+  structurally true. 8x suite re-runs stable. PASS (score 178).
