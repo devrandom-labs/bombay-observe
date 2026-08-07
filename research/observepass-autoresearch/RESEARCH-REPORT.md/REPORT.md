@@ -582,3 +582,6 @@ Affected version under test: workspace commit baseline `cd35234`
 - Batch 32: fuzz `ops` and `future_ops` third 20,000,000-execution rounds
   (285s / 158s) — NO CRASH. Every target now validated at 3x20M
   executions. Result: PASS (depth-only).
+- Batch 33: `PROPTEST_CASES=1000000` — 3/3 properties PASS in 47s; Miri
+  `--test contract` re-run — 12/12 PASS in 6.15s. Result: PASS
+  (depth-only).
