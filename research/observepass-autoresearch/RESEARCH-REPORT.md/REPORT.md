@@ -587,3 +587,6 @@ Affected version under test: workspace commit baseline `cd35234`
   (depth-only).
 - Batch 34: fuzz `promotion_ops` and `waker_ops` fourth 20,000,000-
   execution rounds (173s / 303s) — NO CRASH. Result: PASS (depth-only).
+- Batch 35: Miri `--test future_cancel` 8/8 active PASS (23s) and
+  `--test panic_safety` 3/3 active PASS (7.3s); FINDING reproducers
+  ignored intact. Result: PASS (depth-only).
