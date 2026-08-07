@@ -585,3 +585,5 @@ Affected version under test: workspace commit baseline `cd35234`
 - Batch 33: `PROPTEST_CASES=1000000` — 3/3 properties PASS in 47s; Miri
   `--test contract` re-run — 12/12 PASS in 6.15s. Result: PASS
   (depth-only).
+- Batch 34: fuzz `promotion_ops` and `waker_ops` fourth 20,000,000-
+  execution rounds (173s / 303s) — NO CRASH. Result: PASS (depth-only).
