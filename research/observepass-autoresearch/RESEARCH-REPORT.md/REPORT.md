@@ -566,3 +566,6 @@ Affected version under test: workspace commit baseline `cd35234`
   `future_ops` 20,000,000 in 155s — NO CRASH (all four targets now
   validated at 2x20M). Full harness 5/5 green at score 183. Result: PASS
   (depth-only).
+- Batch 29: `PROPTEST_CASES=5000000` — 3/3 properties PASS in 234s;
+  Miri `--test future_cancel` re-run — 8/8 active PASS in 23s (3
+  FINDING-001 ignored reproducers intact). Result: PASS (depth-only).
