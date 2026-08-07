@@ -559,3 +559,10 @@ Affected version under test: workspace commit baseline `cd35234`
   three properties: 3/3 PASS in 466s release (the churn drop-accounting
   and sequential reference-model properties included). Result: PASS
   (depth-only).
+- Batch 28 (closing sweep): Miri on the updated `--test pool` — 16/16
+  PASS in 556s interpreted (the 1000x same-waker dedup test included; the
+  waker registry lifecycle clean under the interpreter). Symmetric depth
+  on the two ORIGINAL fuzz targets: `ops` 20,000,000 executions in 206s,
+  `future_ops` 20,000,000 in 155s — NO CRASH (all four targets now
+  validated at 2x20M). Full harness 5/5 green at score 183. Result: PASS
+  (depth-only).
