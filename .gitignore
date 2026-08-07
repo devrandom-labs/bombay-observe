@@ -1,4 +1,7 @@
-target/
-mutants.out/
-mutants.out.old/
 .direnv/
+result*
+target/
+**/target/
+.env
+.envrc.local
+.worktrees/

@@ -1,5 +1,12 @@
+# Pinned stable toolchain — the single source of truth for rustup and Nix.
+# Keep this in lockstep with `rust-version` in Cargo.toml.
 [toolchain]
-channel = "1.96.0"
-components = ["rustfmt", "clippy"]
-profile = "minimal"
-
+channel = "1.95.0"
+components = [
+  "cargo",
+  "rustc",
+  "rust-std",
+  "rustfmt",
+  "clippy",
+  "llvm-tools-preview",
+]

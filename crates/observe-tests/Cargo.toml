@@ -1,0 +1,24 @@
+[package]
+name = "bombay-observe-tests"
+description = "Adversarial correctness suite for bombay-observe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+observe.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true, features = ["futures"] }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
