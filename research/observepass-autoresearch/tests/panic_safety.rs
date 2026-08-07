@@ -97,6 +97,47 @@ fn waiters_before_the_panicking_one_are_woken() {
     );
 }
 
+/// The documented wait_timeout self-healing after a stranded drain: a
+/// `wait_timeout` waiter registered AFTER the panicking waker is skipped
+/// by the aborted drain (never unparked), but its deadline elapse wakes it
+/// (`park_until` returns true on a timed-out park) and the loop's COMPLETED
+/// recheck then resolves it to the published outcome — documented in Batch
+/// 10, now pinned by a test.
+#[test]
+fn wait_timeout_waiter_self_heals_after_panicking_drain() {
+    for round in 0..20_u64 {
+        let space = ObservationSpace::<u8, u64>::new();
+        let mut subject = space.subject(1).expect("first registration succeeds");
+
+        let obs_panic = space.observe(&1).expect("subject retained");
+        assert!(!obs_panic.register_waker(&std::task::Waker::from(Arc::new(PanicWake))));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let waiter = {
+            let obs = space.observe(&1).expect("subject retained");
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                obs.wait_timeout(Duration::from_millis(200))
+            })
+        };
+        barrier.wait();
+        // Ensure the waiter is registered and parked before the drain.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            subject.complete(42);
+        }));
+        assert!(panic.is_err(), "the waker's panic propagates (round {round})");
+
+        assert_eq!(
+            waiter.join().expect("waiter panicked"),
+            Some(42),
+            "a stranded wait_timeout waiter must self-heal to the outcome (round {round})"
+        );
+    }
+}
+
 /// After a panicking drain, the outcome is still published and readable,
 /// and the slot can be retired and recycled without further fallout
 /// (drop counts stay exactly-once).

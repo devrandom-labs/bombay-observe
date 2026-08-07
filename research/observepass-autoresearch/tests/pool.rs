@@ -397,6 +397,30 @@ fn hash_map_scale_churn_drops_exactly_once() {
     );
 }
 
+/// The will_wake dedup under load: registering the SAME waker 1000 times
+/// on one pending generation stays ONE entry — completion fires it exactly
+/// once (never 1000 times), and the outcome resolves.
+#[test]
+fn same_waker_registered_1000_times_fires_once() {
+    let space = ObservationSpace::<u32, u64>::new();
+    let mut subject = space.subject(7).expect("first registration succeeds");
+    let observation = space.observe(&7).expect("subject retained");
+    let (waker, probe) = CountWake::waker();
+    for _ in 0..1000 {
+        assert!(
+            !observation.register_waker(&waker),
+            "repeated registration must stay deduped"
+        );
+    }
+    subject.complete(99);
+    assert_eq!(
+        probe.count(),
+        1,
+        "a will_wake-deduped registration must fire exactly once"
+    );
+    assert_eq!(observation.try_get(), Some(99));
+}
+
 /// Every waiter of a pooled-and-recycled slot's NEW generation is woken
 /// exactly once even when the slot saw heavy waiter traffic before.
 #[test]

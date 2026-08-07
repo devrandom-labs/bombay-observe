@@ -543,3 +543,15 @@ Affected version under test: workspace commit baseline `cd35234`
   `into_outcome` is refused — the waker's own observation keeps the slot
   shared — and the outcome stays readable; 50 rounds). Full-harness
   3/3 green. PASS (score 181).
+- Batch 26: (a) `same_waker_registered_1000_times_fires_once` — the
+  will_wake dedup under load: 1000 registrations of one waker stay ONE
+  entry, fired exactly once at completion (the flood test covers distinct
+  wakers; this pins the same-waker dedup). (b)
+  `wait_timeout_waiter_self_heals_after_panicking_drain` — the Batch 10
+  documented self-healing, now pinned: a `wait_timeout` waiter registered
+  after the panicking waker is skipped by the aborted drain, but its
+  deadline elapse wakes it (`park_until` returns true on a timed-out
+  park) and the loop's COMPLETED recheck resolves it to the outcome
+  (20 rounds, 200ms deadlines). (c) depth re-confirmation: `promotion_ops`
+  and `waker_ops` re-run at 20,000,000 executions each (202s / 315s) —
+  NO CRASH. PASS (score 183).
