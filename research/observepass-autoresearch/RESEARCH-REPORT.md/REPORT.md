@@ -573,6 +573,9 @@ Affected version under test: workspace commit baseline `cd35234`
   12/12 PASS (6.15s) and `--test panic_safety` 3/3 active PASS (7.3s;
   the 1 FINDING-002 reproducer ignored), including the new threaded
   `wait_timeout_waiter_self_heals_after_panicking_drain` — a real
-  interpreted thread parking across the aborted drain is clean. Fuzz
+  real interpreted thread parking across the aborted drain is clean. Fuzz
   `promotion_ops` third 20,000,000-execution round in 312s — NO CRASH.
+  Result: PASS (depth-only).
+- Batch 31: `PROPTEST_CASES=2000000` — 3/3 properties PASS in 108s;
+  fuzz `waker_ops` third 20,000,000-execution round in 233s — NO CRASH.
   Result: PASS (depth-only).
