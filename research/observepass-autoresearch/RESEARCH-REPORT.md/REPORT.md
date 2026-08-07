@@ -555,3 +555,7 @@ Affected version under test: workspace commit baseline `cd35234`
   (20 rounds, 200ms deadlines). (c) depth re-confirmation: `promotion_ops`
   and `waker_ops` re-run at 20,000,000 executions each (202s / 315s) —
   NO CRASH. PASS (score 183).
+- Batch 27: deepest proptest campaign — `PROPTEST_CASES=10000000` on all
+  three properties: 3/3 PASS in 466s release (the churn drop-accounting
+  and sequential reference-model properties included). Result: PASS
+  (depth-only).
