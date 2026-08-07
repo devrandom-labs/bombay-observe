@@ -579,3 +579,6 @@ Affected version under test: workspace commit baseline `cd35234`
 - Batch 31: `PROPTEST_CASES=2000000` — 3/3 properties PASS in 108s;
   fuzz `waker_ops` third 20,000,000-execution round in 233s — NO CRASH.
   Result: PASS (depth-only).
+- Batch 32: fuzz `ops` and `future_ops` third 20,000,000-execution rounds
+  (285s / 158s) — NO CRASH. Every target now validated at 3x20M
+  executions. Result: PASS (depth-only).
