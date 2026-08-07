@@ -592,3 +592,11 @@ Affected version under test: workspace commit baseline `cd35234`
   ignored intact. Result: PASS (depth-only).
 - Batch 36: full harness 5/5 green at score 183; `PROPTEST_CASES=500000`
   — 3/3 properties PASS in 24s. Result: PASS (depth-only).
+- Batch 37 (segment cap): final full-harness confirmation 4/4 green at
+  score 183. Campaign state at segment end: 78 tests, 3 properties, 4
+  fuzz targets (each ≥3x20M executions, ASan on three, ~250M+ total),
+  8 loom models at bound 8, Miri across pool/future_cancel/contract/
+  panic_safety/exhaustive/stress-subset/model, 2 findings preserved,
+  harness fully stable (two flake classes root-caused and eliminated in
+  Batches 18/23). All frozen-semantics attack-list items covered;
+  explored-and-closed seams recorded inline.
