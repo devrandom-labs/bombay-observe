@@ -590,3 +590,5 @@ Affected version under test: workspace commit baseline `cd35234`
 - Batch 35: Miri `--test future_cancel` 8/8 active PASS (23s) and
   `--test panic_safety` 3/3 active PASS (7.3s); FINDING reproducers
   ignored intact. Result: PASS (depth-only).
+- Batch 36: full harness 5/5 green at score 183; `PROPTEST_CASES=500000`
+  — 3/3 properties PASS in 24s. Result: PASS (depth-only).
