@@ -30,6 +30,33 @@ Its guarantees are:
 - retained state is bounded by explicit ownership;
 - a panicking user waker cannot strand other waiters.
 
+Observe provides two complementary construction forms:
+
+- [`ObservationSpace`](https://docs.rs/bombay-observe/latest/observe/struct.ObservationSpace.html)
+  manages discoverable, replaceable subjects selected by key;
+- [`pair`](https://docs.rs/bombay-observe/latest/observe/fn.pair.html) creates one
+  already-identified, non-replaceable publication fact without a key table.
+
+## Direct pair
+
+Use a direct pair when the concrete handles already identify the observed
+thing, such as one operation, task, or actor incarnation:
+
+```rust
+let (publisher, observation) = observe::pair::<&'static str>();
+let another_observer = observation.clone();
+
+publisher.complete("done");
+
+assert_eq!(observation.wait(), "done");
+assert_eq!(another_observer.try_get(), Some("done"));
+```
+
+`Publisher` is not cloneable, and `complete(self, outcome)` consumes it, so
+safe code has exactly one publication authority and can publish at most once.
+Dropping an incomplete publisher does not synthesize an outcome; its captured
+observations remain pending until they are themselves dropped.
+
 ## Example
 
 ```rust
