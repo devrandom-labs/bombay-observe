@@ -215,6 +215,15 @@ struct Slot<O> {
 unsafe impl<O: Send + Sync> Sync for Slot<O> {}
 
 impl<O> Slot<O> {
+    /// Construct one fresh pending completion slot.
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            outcome: UnsafeCell::new(MaybeUninit::uninit()),
+            waiters: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
     /// Borrow the outcome cell.
     ///
     /// # Safety
@@ -321,6 +330,48 @@ impl<O> Slot<O> {
                 // SAFETY: `actual` was published by the winner and is live
                 // as long as the slot is.
                 unsafe { &*actual }
+            }
+        }
+    }
+
+    /// Publish the terminal outcome and notify every registered waiter.
+    ///
+    /// The caller owns the slot's unique publication authority and therefore
+    /// invokes this operation at most once.
+    fn complete(&self, outcome: O) {
+        // SAFETY: the caller owns the unique publication authority; the
+        // Release RMW below publishes the write to readers that observe
+        // COMPLETED.
+        unsafe { self.set_outcome(outcome) };
+        let previous = self
+            .state
+            .fetch_or(COMPLETED | OUTCOME_VALID, Ordering::Release);
+        debug_assert_eq!(previous & COMPLETED, 0, "slot completed twice");
+        if previous & HAS_WAITER != 0 {
+            let waiters = {
+                let mut waiters = lock(self.waiters());
+                mem::take(&mut *waiters)
+            };
+            let mut panics = Vec::new();
+            for waiter in waiters {
+                match waiter {
+                    Waiter::Thread(thread) => thread.unpark(),
+                    Waiter::Waker { waker, .. } => {
+                        // A user-provided Wake implementation may panic. Keep
+                        // draining so one faulty waiter cannot strand the
+                        // rest, then propagate the first panic after every
+                        // notification has had its chance to run.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            waker.wake();
+                        }));
+                        if let Err(panic) = result {
+                            panics.push(panic);
+                        }
+                    }
+                }
+            }
+            if let Some(panic) = panics.into_iter().next() {
+                std::panic::resume_unwind(panic);
             }
         }
     }
@@ -558,11 +609,7 @@ where
                 slot.reset();
                 slot
             }
-            None => Arc::new(Slot {
-                state: AtomicUsize::new(0),
-                outcome: UnsafeCell::new(MaybeUninit::uninit()),
-                waiters: AtomicPtr::new(ptr::null_mut()),
-            }),
+            None => Arc::new(Slot::new()),
         };
         entries.map.insert_vacant(
             key.clone(),
@@ -617,42 +664,49 @@ where
     /// Panics when the same subject publishes completion more than once.
     pub fn complete(&mut self, outcome: O) {
         assert!(!self.completed, "subject completed twice");
-        // SAFETY: single writer (invariant 1); the Release RMW below
-        // publishes the write to readers that observe COMPLETED.
-        unsafe { self.slot.set_outcome(outcome) };
         self.completed = true;
-        let previous = self
-            .slot
-            .state
-            .fetch_or(COMPLETED | OUTCOME_VALID, Ordering::Release);
-        if previous & HAS_WAITER != 0 {
-            let waiters = {
-                let mut waiters = lock(self.slot.waiters());
-                mem::take(&mut *waiters)
-            };
-            let mut panics = Vec::new();
-            for waiter in waiters {
-                match waiter {
-                    Waiter::Thread(thread) => thread.unpark(),
-                    Waiter::Waker { waker, .. } => {
-                        // A user-provided Wake implementation may panic. Keep
-                        // draining so one faulty waiter cannot strand the
-                        // rest, then propagate the first panic after every
-                        // notification has had its chance to run.
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            waker.wake();
-                        }));
-                        if let Err(panic) = result {
-                            panics.push(panic);
-                        }
-                    }
-                }
-            }
-            if let Some(panic) = panics.into_iter().next() {
-                std::panic::resume_unwind(panic);
-            }
-        }
+        self.slot.complete(outcome);
     }
+}
+
+/// The unique publication authority for one unkeyed observation pair.
+///
+/// A publisher is created by [`pair`], is deliberately not cloneable, and is
+/// consumed by [`Publisher::complete`]. Dropping it before completion does not
+/// synthesize an outcome; captured observations remain pending until dropped.
+///
+/// ```compile_fail
+/// let (publisher, _) = observe::pair::<u64>();
+/// let duplicate = publisher.clone();
+/// ```
+///
+/// ```compile_fail
+/// let (publisher, _) = observe::pair::<u64>();
+/// publisher.complete(1);
+/// publisher.complete(2);
+/// ```
+#[must_use = "dropping an incomplete publisher leaves its observations pending"]
+pub struct Publisher<O> {
+    slot: Arc<Slot<O>>,
+}
+
+impl<O> Publisher<O> {
+    /// Publish the terminal outcome exactly once.
+    ///
+    /// This consumes the pair's only publication authority. Every observation
+    /// captured from the pair can retrieve the retained outcome.
+    pub fn complete(self, outcome: O) {
+        self.slot.complete(outcome);
+    }
+}
+
+/// Construct one unkeyed, one-publication observation pair.
+///
+/// The publisher is the pair's unique completion authority. The observation
+/// is cloneable and every clone remains attached to this exact pair.
+pub fn pair<O>() -> (Publisher<O>, Observation<O>) {
+    let slot = Arc::new(Slot::new());
+    (Publisher { slot: slot.clone() }, Observation { slot })
 }
 
 impl<K, O> Drop for Subject<K, O>
@@ -677,6 +731,14 @@ where
 /// A cancellable observation of one captured subject generation.
 pub struct Observation<O> {
     slot: Arc<Slot<O>>,
+}
+
+impl<O> Clone for Observation<O> {
+    fn clone(&self) -> Self {
+        Self {
+            slot: self.slot.clone(),
+        }
+    }
 }
 
 impl<O: Clone> Observation<O> {
