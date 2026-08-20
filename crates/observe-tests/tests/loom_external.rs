@@ -23,11 +23,15 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use observe::{ObservationSpace, affine_pair};
 
-const PREEMPTIONS: usize = 8;
+const DEFAULT_PREEMPTIONS: usize = 8;
 
 fn builder() -> loom::model::Builder {
     let mut builder = loom::model::Builder::new();
-    builder.preemption_bound = Some(PREEMPTIONS);
+    let preemptions = std::env::var("LOOM_MAX_PREEMPTIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_PREEMPTIONS);
+    builder.preemption_bound = Some(preemptions);
     builder
 }
 
