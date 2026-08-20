@@ -207,7 +207,7 @@ fn wait_timeout_returns_outcome_when_completed() {
 /// under Miri, which would make `will_wake` spuriously false.
 #[test]
 fn register_waker_is_idempotent_per_task() {
-    use crate::{Waiter, lock};
+    use crate::{Waiter, Waiters, lock};
     use std::task::{RawWaker, RawWakerVTable, Waker};
 
     struct RawFlagWaker(AtomicBool);
@@ -249,6 +249,10 @@ fn register_waker_is_idempotent_per_task() {
     assert!(!observation.register_waker(&waker));
     let waiters = lock(observation.slot.waiters());
     assert_eq!(waiters.len(), 1);
+    assert!(
+        matches!(&*waiters, Waiters::One(_)),
+        "one registration must stay inline in the slot"
+    );
     assert!(matches!(
         &waiters[0],
         Waiter::Waker { waker: registered, .. } if registered.will_wake(&waker)
@@ -300,19 +304,13 @@ fn dropping_observation_future_deregisters_waker() {
     assert_eq!(space.observe(&7_u64).unwrap().try_get(), Some(9_u64));
 }
 
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize};
-
+use std::sync::atomic::AtomicUsize;
 use triomphe::Arc as SlotArc;
 
 use crate::{Slot, SlotEntry, lock, write_lock};
 
-/// Cancellation after a waker migration deregisters BOTH registrations: a
-/// future polled first with waker A and later with a different waker B, then
-/// dropped, must not leave either waker registered to be fired by a later
-/// completion.
+/// Migration replaces waker A with B, and cancellation then deregisters B.
+/// Neither may remain registered to be fired by a later completion.
 #[test]
 fn future_drop_deregisters_migrated_waker() {
     let space = ObservationSpace::new();
@@ -402,11 +400,7 @@ fn stale_retirement_cannot_remove_replacement() {
     {
         let mut entries = write_lock(&space.inner.entries);
         assert!(entries.map.remove_if(&7_u64, old_generation));
-        let replacement = SlotArc::new(Slot {
-            state: AtomicUsize::new(0),
-            outcome: UnsafeCell::new(MaybeUninit::uninit()),
-            waiters: AtomicPtr::new(ptr::null_mut()),
-        });
+        let replacement = SlotArc::new(Slot::new());
         entries.map.insert_vacant(
             7_u64,
             SlotEntry {

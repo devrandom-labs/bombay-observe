@@ -48,3 +48,6 @@ jobs:
 
       - name: Flake Check
         run: nix flake check
+
+      - name: Loom Models
+        run: nix develop --command just loom

@@ -12,6 +12,7 @@
 //! - hot-path and wait-round-trip latency p50/p99;
 //! - contention scaling at 1/2/4/8/16 threads;
 //! - per-operation allocation count and bytes;
+//! - affine await allocation count and bytes, including its one slot;
 //! - retained bytes/blocks per subject+observer and the after-drop residue.
 //!
 //! All workloads use fixed operation counts and disjoint key ranges, with no
@@ -22,12 +23,15 @@
 //! does not touch the mechanism's code.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::future::Future;
 use std::hint::black_box;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use observe::ObservationSpace;
+use observe::{ObservationSpace, affine_pair};
 
 /// Operations per throughput scenario.
 const N: u64 = 1_000_000;
@@ -357,6 +361,32 @@ fn allocation_and_retention() {
         N_ALLOC,
     );
     drop(space);
+
+    // Phase 1b: an affine pair is polled pending, completed, and polled ready.
+    // Its sole waiter stays inline, so the pair's observation slot must be
+    // the only allocation in each operation.
+    let before = snapshot();
+    let mut context = Context::from_waker(Waker::noop());
+    for outcome in 0..N_ALLOC {
+        let (publisher, mut observation) = affine_pair();
+        assert!(Pin::new(&mut observation).poll(&mut context).is_pending());
+        publisher.complete(outcome);
+        assert_eq!(
+            Pin::new(&mut observation).poll(&mut context),
+            Poll::Ready(outcome)
+        );
+    }
+    let after = snapshot();
+    emit_ratio(
+        "affine_alloc_bytes_per_op",
+        after.total_bytes - before.total_bytes,
+        N_ALLOC,
+    );
+    emit_ratio(
+        "affine_alloc_blocks_per_op",
+        after.total_blocks - before.total_blocks,
+        N_ALLOC,
+    );
 
     // Phase 2: retained heap while M subject+observer pairs stay live.
     let mut subjects = Vec::with_capacity(usize::try_from(M_RETAINED).expect("fits usize"));

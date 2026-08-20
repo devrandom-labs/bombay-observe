@@ -8,6 +8,7 @@ test:
 
 loom:
     RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p bombay-observe --lib --release
+    RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p bombay-observe-tests --test loom_external --release
 
 deny:
     cargo deny check

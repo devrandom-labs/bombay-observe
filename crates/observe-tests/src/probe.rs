@@ -191,10 +191,10 @@ impl ThreadWake {
 }
 
 /// Poll a future once with the given waker.
-pub fn poll_once<O: Clone>(
-    future: std::pin::Pin<&mut observe::ObservationFuture<O>>,
+pub fn poll_once<F: Future>(
+    future: std::pin::Pin<&mut F>,
     waker: &std::task::Waker,
-) -> std::task::Poll<O> {
+) -> std::task::Poll<F::Output> {
     let mut cx = std::task::Context::from_waker(waker);
     future.poll(&mut cx)
 }

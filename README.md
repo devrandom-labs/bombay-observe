@@ -35,7 +35,10 @@ Observe provides two complementary construction forms:
 - [`ObservationSpace`](https://docs.rs/bombay-observe/latest/observe/struct.ObservationSpace.html)
   manages discoverable, replaceable subjects selected by key;
 - [`pair`](https://docs.rs/bombay-observe/latest/observe/fn.pair.html) creates one
-  already-identified, non-replaceable publication fact without a key table.
+  already-identified, non-replaceable publication fact with cloneable
+  observations;
+- [`affine_pair`](https://docs.rs/bombay-observe/latest/observe/fn.affine_pair.html)
+  creates the same direct publication shape with one move-only observation.
 
 ## Direct pair
 
@@ -57,6 +60,27 @@ safe code has exactly one publication authority and can publish at most once.
 Dropping an incomplete publisher does not synthesize an outcome; its captured
 observations remain pending until they are themselves dropped.
 
+Use an affine pair when the outcome itself must be returned by ownership and
+cannot or should not be cloned:
+
+```rust
+# async fn example() {
+struct Command(String);
+
+let (publisher, observation) = observe::affine_pair();
+publisher.complete(Ok::<_, ()>(Command("rejected".to_owned())));
+
+let result = observation.await;
+assert_eq!(result.unwrap().0, "rejected");
+# }
+```
+
+`AffineObservation` is a concrete, non-cloneable future. It moves the single
+outcome directly from Observe's typed slot, replaces stale wakers when a task
+migrates, and deregisters its current waker on cancellation. A single waiter
+is retained inline, so this path adds no allocation beyond the observation
+slot.
+
 ## Example
 
 ```rust
@@ -71,8 +95,9 @@ assert_eq!(observation.wait(), "done");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`Observation` also implements `IntoFuture`, so it can be awaited directly.
-The crate does not depend on an async runtime.
+`Observation` implements `IntoFuture` for cloneable outcomes, while
+`AffineObservation` implements `Future` without an `O: Clone` bound. The crate
+does not depend on an async runtime.
 
 ## Development
 

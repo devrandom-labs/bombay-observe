@@ -6,8 +6,8 @@ use loom::sync::atomic::AtomicUsize;
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::mem::{self, MaybeUninit};
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
-use std::ptr;
 #[cfg(loom)]
 use std::sync::PoisonError;
 #[cfg(not(loom))]
@@ -75,8 +75,6 @@ use loom::sync::Mutex;
 #[cfg(loom)]
 use loom::sync::RwLock;
 #[cfg(loom)]
-use loom::sync::atomic::AtomicPtr;
-#[cfg(loom)]
 use loom::thread::{Thread, current, park};
 #[cfg(not(loom))]
 use parking_lot::Mutex;
@@ -84,8 +82,6 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 #[cfg(not(loom))]
 use std::cell::UnsafeCell;
-#[cfg(not(loom))]
-use std::sync::atomic::AtomicPtr;
 #[cfg(not(loom))]
 use std::thread::{Thread, current, park, park_timeout};
 #[cfg(not(loom))]
@@ -157,8 +153,8 @@ const COMPLETED: usize = 1 << 0;
 const HAS_WAITER: usize = 1 << 1;
 /// Set exactly while the outcome cell holds a live value. Rides the state
 /// word (set by `complete`'s RMW, cleared by `reset`'s recycle and
-/// `into_outcome`'s take) so the outcome cell needs no separate tag: the
-/// validity gate is `COMPLETED` for readers, `OUTCOME_VALID` for droppers.
+/// an ownership-transferring take) so the outcome cell needs no separate tag:
+/// the validity gate is `COMPLETED` for readers, `OUTCOME_VALID` for droppers.
 const OUTCOME_VALID: usize = 1 << 2;
 
 /// A registered waiter: either a blocked thread (sync [`Observation::wait`])
@@ -176,6 +172,102 @@ enum Waiter {
     },
 }
 
+/// Inline-first waiter storage.
+///
+/// The overwhelmingly common async shape has one task waiting for one
+/// publication. Keeping that first waiter inside the slot means polling an
+/// affine observation performs no allocation beyond the slot's existing
+/// `Arc`; shared fan-out promotes to a `Vec` only when a second distinct
+/// waiter is installed.
+#[derive(Default)]
+enum Waiters {
+    #[default]
+    Empty,
+    One(Waiter),
+    Many(Vec<Waiter>),
+}
+
+impl Waiters {
+    fn push(&mut self, waiter: Waiter) {
+        match mem::take(self) {
+            Self::Empty => *self = Self::One(waiter),
+            Self::One(first) => *self = Self::Many(vec![first, waiter]),
+            Self::Many(mut waiters) => {
+                waiters.push(waiter);
+                *self = Self::Many(waiters);
+            }
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Waiter) -> bool) {
+        match mem::take(self) {
+            Self::Empty => {}
+            Self::One(waiter) => {
+                if keep(&waiter) {
+                    *self = Self::One(waiter);
+                }
+            }
+            Self::Many(mut waiters) => {
+                waiters.retain(&mut keep);
+                *self = match waiters.len() {
+                    0 => Self::Empty,
+                    1 => Self::One(waiters.pop().expect("one waiter remains")),
+                    _ => Self::Many(waiters),
+                };
+            }
+        }
+    }
+
+    fn retain_mut(&mut self, mut keep: impl FnMut(&mut Waiter) -> bool) {
+        match mem::take(self) {
+            Self::Empty => {}
+            Self::One(mut waiter) => {
+                if keep(&mut waiter) {
+                    *self = Self::One(waiter);
+                }
+            }
+            Self::Many(mut waiters) => {
+                waiters.retain_mut(&mut keep);
+                *self = match waiters.len() {
+                    0 => Self::Empty,
+                    1 => Self::One(waiters.pop().expect("one waiter remains")),
+                    _ => Self::Many(waiters),
+                };
+            }
+        }
+    }
+
+    fn for_each(self, mut visit: impl FnMut(Waiter)) {
+        match self {
+            Self::Empty => {}
+            Self::One(waiter) => visit(waiter),
+            Self::Many(waiters) => waiters.into_iter().for_each(visit),
+        }
+    }
+}
+
+impl Deref for Waiters {
+    type Target = [Waiter];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Empty => &[],
+            Self::One(waiter) => std::slice::from_ref(waiter),
+            Self::Many(waiters) => waiters,
+        }
+    }
+}
+
+impl DerefMut for Waiters {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Empty => &mut [],
+            Self::One(waiter) => std::slice::from_mut(waiter),
+            Self::Many(waiters) => waiters,
+        }
+    }
+}
+
 /// Per-subject completion cell: a lock-free outcome publication point plus a
 /// mutex-protected waiter registry.
 ///
@@ -187,8 +279,8 @@ enum Waiter {
 ///   Acquire-or-stronger load of `state`, which synchronizes-with that
 ///   Release RMW.
 /// - The outcome cell is dropped exactly once: by `reset` (a pooled slot has
-///   no observers) or by `into_outcome`'s take (which clears `OUTCOME_VALID`,
-///   so the slot's final drop skips it).
+///   no observers), by the slot's final drop, or transferred by a unique take
+///   (which clears `OUTCOME_VALID`, so the slot's final drop skips it).
 /// - The `HAS_WAITER` bit and the `COMPLETED` bit share one word, so the two
 ///   RMWs are totally ordered by the modification order: a waiter that
 ///   completes its registration never parks without either seeing `COMPLETED`
@@ -199,13 +291,9 @@ struct Slot<O> {
     // O-sized (no Option tag): the OUTCOME_VALID bit in `state` is the
     // liveness marker, and COMPLETED gates every read.
     outcome: UnsafeCell<MaybeUninit<O>>,
-    // Raw pointer to a lazily created `Mutex<Vec<Waiter>>` (null until the
-    // first waiter). The slot owns the allocation and reclaims it at its
-    // final drop, so the common case (no waiters ever) keeps the slot 8
-    // bytes smaller and allocation-free; the hot path never touches this
-    // field. The Arc indirection is unnecessary: the mutex is owned by the
-    // slot itself, which outlives every waiter.
-    waiters: AtomicPtr<Mutex<Vec<Waiter>>>,
+    // One waiter is retained inline in the slot allocation. Fan-out promotes
+    // to a Vec only for a second distinct waiter.
+    waiters: Mutex<Waiters>,
 }
 
 // SAFETY: the outcome cell is written exactly once, before the COMPLETED bit
@@ -220,7 +308,7 @@ impl<O> Slot<O> {
         Self {
             state: AtomicUsize::new(0),
             outcome: UnsafeCell::new(MaybeUninit::uninit()),
-            waiters: AtomicPtr::new(ptr::null_mut()),
+            waiters: Mutex::new(Waiters::Empty),
         }
     }
 
@@ -297,41 +385,123 @@ impl<O> Slot<O> {
         });
     }
 
-    /// The waiters registry, created on first use.
+    /// Move the published outcome out of this slot.
     ///
-    /// The registry is a `Box<Mutex<Vec<Waiter>>>` published by a CAS from
-    /// null on the first access and reclaimed by the slot's final drop.
-    /// Losing the init race reclaims the loser's box; the winner's pointer
-    /// is live as long as the slot is.
-    fn waiters(&self) -> &Mutex<Vec<Waiter>> {
-        let ptr = self.waiters.load(Ordering::Acquire);
-        if !ptr.is_null() {
-            // SAFETY: a non-null pointer was published by the init CAS and
-            // is reclaimed only by this slot's final drop, which cannot run
-            // while we hold a borrow of the slot.
-            return unsafe { &*ptr };
+    /// Returns `None` while publication is pending. Once publication is
+    /// visible, `OUTCOME_VALID` is cleared before the value is moved so the
+    /// slot destructor cannot drop it again.
+    ///
+    /// # Safety
+    /// The caller must own the only authority that can read or take the
+    /// outcome. This is true after `Arc::try_unwrap`, and for an affine pair's
+    /// sole observation. Calling this while a shared observation can read the
+    /// outcome would invalidate its reference.
+    unsafe fn try_take_outcome(&self) -> Option<O> {
+        let state = self.state.load(Ordering::Acquire);
+        if state & COMPLETED == 0 {
+            return None;
         }
-        // SAFETY: `new` is a fresh, uniquely owned allocation.
-        let new = Box::into_raw(Box::new(Mutex::new(Vec::new())));
-        match self.waiters.compare_exchange(
-            ptr::null_mut(),
-            new,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // SAFETY: we won the init race; `new` is published.
-                unsafe { &*new }
-            }
-            Err(actual) => {
-                // Lost the init race: reclaim our box and use the winner's.
-                // SAFETY: `new` was never published; we own it exclusively.
-                drop(unsafe { Box::from_raw(new) });
-                // SAFETY: `actual` was published by the winner and is live
-                // as long as the slot is.
-                unsafe { &*actual }
+        let previous = self.state.fetch_and(!OUTCOME_VALID, Ordering::Relaxed);
+        assert_ne!(
+            previous & OUTCOME_VALID,
+            0,
+            "completed observation polled after yielding its outcome"
+        );
+        #[cfg(not(loom))]
+        {
+            // SAFETY: the caller guarantees unique outcome access, COMPLETED
+            // was observed with Acquire, and this RMW claimed OUTCOME_VALID.
+            Some(unsafe { self.outcome.get().read().assume_init() })
+        }
+        #[cfg(loom)]
+        {
+            Some(self.outcome.with(|ptr| {
+                // SAFETY: same contract as the non-loom branch; loom checks
+                // the cell access against modeled interleavings.
+                unsafe { (*ptr).assume_init_read() }
+            }))
+        }
+    }
+
+    fn waiters(&self) -> &Mutex<Waiters> {
+        &self.waiters
+    }
+
+    /// Install or migrate one future's logical waker registration.
+    ///
+    /// `previous` is the future's currently installed waker, if any. A
+    /// migration first installs the replacement and then removes one logical
+    /// owner from the previous physical entry under the same lock. Shared
+    /// task wakers remain deduplicated and sibling ownership remains counted,
+    /// while the migrating future leaves no stale registration behind.
+    fn update_future_waker(&self, previous: Option<&Waker>, next: &Waker) -> bool {
+        if self.state.load(Ordering::Acquire) & COMPLETED != 0 {
+            return true;
+        }
+        self.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
+        let mut waiters = lock(self.waiters());
+        if self.state.load(Ordering::SeqCst) & COMPLETED != 0 {
+            return true;
+        }
+        if previous.is_some_and(|waker| waker.will_wake(next)) {
+            return false;
+        }
+
+        let mut joined_existing = false;
+        for waiter in waiters.iter_mut() {
+            if let Waiter::Waker {
+                waker,
+                future_owners,
+                ..
+            } = waiter
+                && waker.will_wake(next)
+            {
+                *future_owners = future_owners
+                    .checked_add(1)
+                    .expect("waker registration count overflowed");
+                joined_existing = true;
+                break;
             }
         }
+        if !joined_existing {
+            waiters.push(Waiter::Waker {
+                waker: next.clone(),
+                persistent: false,
+                future_owners: 1,
+            });
+        }
+
+        if let Some(previous) = previous {
+            Self::remove_future_waker_owner(&mut waiters, previous);
+        }
+        false
+    }
+
+    /// Remove one future's logical ownership of its current waker.
+    fn deregister_future_waker(&self, waker: &Waker) {
+        let mut waiters = lock(self.waiters());
+        Self::remove_future_waker_owner(&mut waiters, waker);
+    }
+
+    fn remove_future_waker_owner(waiters: &mut Waiters, target: &Waker) {
+        let mut removed = false;
+        waiters.retain_mut(|waiter| {
+            let Waiter::Waker {
+                waker,
+                persistent,
+                future_owners,
+            } = waiter
+            else {
+                return true;
+            };
+            if removed || !waker.will_wake(target) {
+                return true;
+            }
+            debug_assert!(*future_owners > 0);
+            *future_owners -= 1;
+            removed = true;
+            *persistent || *future_owners != 0
+        });
     }
 
     /// Publish the terminal outcome and notify every registered waiter.
@@ -352,8 +522,8 @@ impl<O> Slot<O> {
                 let mut waiters = lock(self.waiters());
                 mem::take(&mut *waiters)
             };
-            let mut panics = Vec::new();
-            for waiter in waiters {
+            let mut first_panic = None;
+            waiters.for_each(|waiter| {
                 match waiter {
                     Waiter::Thread(thread) => thread.unpark(),
                     Waiter::Waker { waker, .. } => {
@@ -364,13 +534,15 @@ impl<O> Slot<O> {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             waker.wake();
                         }));
-                        if let Err(panic) = result {
-                            panics.push(panic);
+                        if first_panic.is_none()
+                            && let Err(panic) = result
+                        {
+                            first_panic = Some(panic);
                         }
                     }
                 }
-            }
-            if let Some(panic) = panics.into_iter().next() {
+            });
+            if let Some(panic) = first_panic {
                 std::panic::resume_unwind(panic);
             }
         }
@@ -393,13 +565,7 @@ impl<O> Slot<O> {
             // is retained in the pool or fired across generations. No waiter
             // can be in flight: a live waiter holds an observation Arc, and
             // pooled slots have none.
-            let ptr = self.waiters.load(Ordering::Acquire);
-            if !ptr.is_null() {
-                // SAFETY: HAS_WAITER implies a waiter registered, which
-                // initialized the registry; the pointer is live as long as
-                // the slot is.
-                unsafe { lock(&*ptr).clear() };
-            }
+            *lock(self.waiters()) = Waiters::Empty;
         }
         self.state.store(0, Ordering::Release);
     }
@@ -410,18 +576,11 @@ impl<O> Drop for Slot<O> {
         // SAFETY: the last Arc reference is being dropped (reclamation is
         // entirely Arc-based), so no other thread can access the slot.
         // OUTCOME_VALID is set exactly while the cell holds a live value:
-        // written by complete, cleared by reset's recycle and into_outcome's
-        // take, so the drop fires exactly once.
+        // written by complete, cleared by reset's recycle or a unique take,
+        // so the drop fires exactly once.
         if self.state.load(Ordering::Relaxed) & OUTCOME_VALID != 0 {
             // SAFETY: see above.
             unsafe { self.drop_outcome() };
-        }
-        // Reclaim the lazily created waiters registry, if any.
-        let ptr = self.waiters.load(Ordering::Relaxed);
-        if !ptr.is_null() {
-            // SAFETY: the last reference is being dropped; the box is owned
-            // by this slot and no other thread can access it.
-            drop(unsafe { Box::from_raw(ptr) });
         }
     }
 }
@@ -690,6 +849,12 @@ pub struct Publisher<O> {
     slot: Arc<Slot<O>>,
 }
 
+// SAFETY: a publisher is unique, exposes only a consuming `complete`, and
+// never reads the outcome. Moving publication authority and `O` to another
+// thread therefore requires `O: Send`, but not `O: Sync`; cloneable
+// observations retain their stricter auto-trait bounds through `Slot<O>`.
+unsafe impl<O: Send> Send for Publisher<O> {}
+
 impl<O> Publisher<O> {
     /// Publish the terminal outcome exactly once.
     ///
@@ -707,6 +872,40 @@ impl<O> Publisher<O> {
 pub fn pair<O>() -> (Publisher<O>, Observation<O>) {
     let slot = Arc::new(Slot::new());
     (Publisher { slot: slot.clone() }, Observation { slot })
+}
+
+/// Construct an unkeyed pair whose sole observation moves out the outcome.
+///
+/// The publisher is the pair's unique completion authority and remains
+/// consuming. The affine observation is deliberately not cloneable and can
+/// be awaited without requiring `O: Clone`; awaiting it yields the one
+/// published `O` by value.
+///
+/// Dropping the publisher before completion does not synthesize an outcome.
+/// The observation remains pending until it is cancelled, matching [`pair`]'s
+/// incomplete-publication semantics.
+///
+/// ```no_run
+/// # async fn example() {
+/// struct MoveOnly(&'static str);
+/// let (publisher, observation) = observe::affine_pair();
+/// publisher.complete(MoveOnly("owned"));
+/// assert_eq!(observation.await.0, "owned");
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// let (_, observation) = observe::affine_pair::<u64>();
+/// let duplicate = observation.clone();
+/// ```
+pub fn affine_pair<O>() -> (Publisher<O>, AffineObservation<O>) {
+    let slot = Arc::new(Slot::new());
+    (
+        Publisher { slot: slot.clone() },
+        AffineObservation {
+            registration: FutureRegistration::new(slot),
+        },
+    )
 }
 
 impl<K, O> Drop for Subject<K, O>
@@ -870,23 +1069,9 @@ impl<O> Observation<O> {
     pub fn into_outcome(self) -> Option<O> {
         let slot = Arc::try_unwrap(self.slot).ok()?;
         // Exclusive ownership via the move; no access can race it.
-        if slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
-            // SAFETY: COMPLETED observed with Acquire (invariant 2), so the
-            // cell was written before the Release RMW that set it.
-            #[cfg(not(loom))]
-            let outcome = unsafe { slot.outcome.get().read().assume_init() };
-            #[cfg(loom)]
-            let outcome = slot.outcome.with(|ptr| {
-                // SAFETY: same gating as the non-loom branch; loom verifies
-                // the access against its scheduling model.
-                unsafe { (*ptr).assume_init_read() }
-            });
-            // Mark the value taken so the slot's Drop does not double-drop.
-            slot.state.fetch_and(!OUTCOME_VALID, Ordering::Relaxed);
-            Some(outcome)
-        } else {
-            None
-        }
+        // SAFETY: `Arc::try_unwrap` proved this handle owns the slot and its
+        // outcome exclusively.
+        unsafe { slot.try_take_outcome() }
     }
 
     /// Register a waker to be woken when the outcome is published, for
@@ -913,7 +1098,7 @@ impl<O> Observation<O> {
         // idempotent (the std-endorsed pattern behind `Waker::clone_from`):
         // repeated polling of the same task never accumulates duplicates,
         // and the re-registration path performs no clone and no allocation.
-        for waiter in &mut *waiters {
+        for waiter in waiters.iter_mut() {
             if let Waiter::Waker {
                 waker: existing,
                 persistent,
@@ -932,59 +1117,58 @@ impl<O> Observation<O> {
         });
         false
     }
+}
 
-    /// Register one future-owned logical use of `waker`.
-    ///
-    /// Returns `true` if completion won the registration race. The caller
-    /// invokes this at most once for each distinct waker it owns.
-    fn register_future_waker(&self, waker: &Waker) -> bool {
-        if self.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
-            return true;
+/// One future's current registration in a completion slot.
+///
+/// Both observation flavors use this lifecycle: repeated polls are
+/// idempotent, migration replaces the previous waker under the waiter lock,
+/// and drop removes the one current logical owner.
+struct FutureRegistration<O> {
+    slot: Arc<Slot<O>>,
+    waker: Option<Waker>,
+}
+
+impl<O> FutureRegistration<O> {
+    fn new(slot: Arc<Slot<O>>) -> Self {
+        Self { slot, waker: None }
+    }
+
+    fn update(&mut self, cx: &Context<'_>) {
+        if self
+            .waker
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(cx.waker()))
+        {
+            return;
         }
-        self.slot.state.fetch_or(HAS_WAITER, Ordering::SeqCst);
-        let mut waiters = lock(self.slot.waiters());
-        if self.slot.state.load(Ordering::SeqCst) & COMPLETED != 0 {
-            return true;
+        // Clone before mutating the registry. If a user-provided RawWaker
+        // clone panics, the previous registration and local bookkeeping stay
+        // unchanged.
+        let next = cx.waker().clone();
+        if self.slot.update_future_waker(self.waker.as_ref(), &next) {
+            return;
         }
-        for waiter in &mut *waiters {
-            if let Waiter::Waker {
-                waker: existing,
-                future_owners,
-                ..
-            } = waiter
-                && existing.will_wake(waker)
-            {
-                *future_owners = future_owners
-                    .checked_add(1)
-                    .expect("waker registration count overflowed");
-                return false;
-            }
-        }
-        waiters.push(Waiter::Waker {
-            waker: waker.clone(),
-            persistent: false,
-            future_owners: 1,
-        });
-        false
+        let previous = self.waker.replace(next);
+        drop(previous);
     }
 }
 
-/// A future that resolves to the outcome when the subject completes.
+impl<O> Drop for FutureRegistration<O> {
+    fn drop(&mut self) {
+        if let Some(waker) = &self.waker {
+            self.slot.deregister_future_waker(waker);
+        }
+    }
+}
+
+/// A future that resolves to a clone of a shared outcome.
 ///
-/// Created via [`Observation`]'s [`IntoFuture`] impl (the `.await` sugar in
-/// an async adapter). Polling registers the task's waker idempotently
-/// (repeated polls never accumulate duplicate registrations); dropping the
-/// future before completion deregisters its waker, so cancelled
-/// observations leave no stale registration that would keep the waker's
-/// payload alive or fire across generations.
+/// Created via [`Observation`]'s [`IntoFuture`] impl. A task has exactly one
+/// current waker registration: polling after migration replaces the old
+/// registration, and cancellation removes the replacement.
 pub struct ObservationFuture<O> {
-    observation: Observation<O>,
-    // Every distinct waker this future has polled with. A task can migrate
-    // between executors, registering a new waker each time (`will_wake`
-    // dedup only folds identical wakers), and cancellation must deregister
-    // all of them - remembering only the latest would leave earlier wakers
-    // registered to be fired after the future is dropped.
-    wakers: Vec<Waker>,
+    registration: FutureRegistration<O>,
 }
 
 impl<O: Clone> Future for ObservationFuture<O> {
@@ -998,54 +1182,18 @@ impl<O: Clone> Future for ObservationFuture<O> {
         // place. This is the standard manual pin-projection for !Unpin
         // futures; the future's `Drop` also runs fine on a pinned value.
         let this = unsafe { self.get_unchecked_mut() };
-        if let Some(outcome) = this.observation.try_get() {
+        if this.registration.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
+            // SAFETY: COMPLETED observed with Acquire.
+            let outcome = unsafe { this.registration.slot.outcome_ref() }.clone();
             return Poll::Ready(outcome);
         }
-        // Register each distinct waker once for this future. The registry
-        // reference-counts shared task wakers so cancelling a sibling cannot
-        // remove the survivor's logical registration.
-        let known_waker = this.wakers.iter().any(|w| w.will_wake(cx.waker()));
-        if !known_waker {
-            let _ = this.observation.register_future_waker(cx.waker());
-        }
-        if let Some(outcome) = this.observation.try_get() {
+        this.registration.update(cx);
+        if this.registration.slot.state.load(Ordering::Acquire) & COMPLETED != 0 {
+            // SAFETY: COMPLETED observed with Acquire.
+            let outcome = unsafe { this.registration.slot.outcome_ref() }.clone();
             return Poll::Ready(outcome);
-        }
-        // Track this waker for cancellation, deduplicated exactly like the
-        // registration: repeated polling of the same task stays one entry,
-        // a migrated task accumulates its distinct wakers.
-        if !known_waker {
-            this.wakers.push(cx.waker().clone());
         }
         Poll::Pending
-    }
-}
-
-impl<O> Drop for ObservationFuture<O> {
-    fn drop(&mut self) {
-        // Deregister every waker this future registered: cancelling the
-        // future must not leave a stale registration (including one from a
-        // pre-migration waker) behind.
-        if self.wakers.is_empty() {
-            return;
-        }
-        let mut waiters = lock(self.observation.slot.waiters());
-        waiters.retain_mut(|waiter| {
-            let Waiter::Waker {
-                waker,
-                persistent,
-                future_owners,
-            } = waiter
-            else {
-                return true;
-            };
-            if !self.wakers.iter().any(|mine| mine.will_wake(waker)) {
-                return true;
-            }
-            debug_assert!(*future_owners > 0);
-            *future_owners -= 1;
-            *persistent || *future_owners != 0
-        });
     }
 }
 
@@ -1055,9 +1203,52 @@ impl<O: Clone> IntoFuture for Observation<O> {
 
     fn into_future(self) -> Self::IntoFuture {
         ObservationFuture {
-            observation: self,
-            wakers: Vec::new(),
+            registration: FutureRegistration::new(self.slot),
         }
+    }
+}
+
+/// A unique, cancellable future that moves out one published outcome.
+///
+/// Created by [`affine_pair`]. This type is deliberately not cloneable.
+/// Awaiting it requires no `O: Clone` bound and transfers the exact value
+/// stored in the observation slot. Its first and only waker is stored inline
+/// in that slot; task migration replaces the old registration rather than
+/// accumulating stale wakers.
+///
+/// ```compile_fail
+/// let (_, observation) = observe::affine_pair::<String>();
+/// let duplicate = observation.clone();
+/// ```
+#[must_use = "dropping an affine observation cancels its wait"]
+pub struct AffineObservation<O> {
+    registration: FutureRegistration<O>,
+}
+
+// SAFETY: an affine observation is the only handle allowed to read or move
+// its outcome. Moving it between threads transfers that unique authority, so
+// `O: Send` is sufficient even though cloneable observations require `Sync`.
+unsafe impl<O: Send> Send for AffineObservation<O> {}
+
+impl<O> Future for AffineObservation<O> {
+    type Output = O;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+        // SAFETY: the registration is mutated in place and is never moved out
+        // of the pinned observation.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `AffineObservation` is the pair's sole outcome-reading
+        // authority and cannot be cloned.
+        if let Some(outcome) = unsafe { this.registration.slot.try_take_outcome() } {
+            return Poll::Ready(outcome);
+        }
+        this.registration.update(cx);
+        // SAFETY: same unique affine authority. The second check closes the
+        // publication-versus-registration race.
+        if let Some(outcome) = unsafe { this.registration.slot.try_take_outcome() } {
+            return Poll::Ready(outcome);
+        }
+        Poll::Pending
     }
 }
 

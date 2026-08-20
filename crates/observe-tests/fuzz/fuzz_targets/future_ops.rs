@@ -1,7 +1,7 @@
 //! Coverage-guided fuzz target: futures, waker registration, polling, and
-//! cancellation sequences. Exact wake-count assertions: a registered waker
-//! of a live future fires exactly once at completion; a cancelled future's
-//! wakers never fire. Futures here always poll with per-future distinct
+//! cancellation sequences. Exact wake-count assertions: only a live future's
+//! current waker fires at completion; migrated and cancelled wakers never
+//! fire. Futures here always poll with per-future distinct
 //! wakers (the shared-waker topology deterministically hits shared-waker cancellation regression,
 //! preserved separately and intentionally out of this target).
 
@@ -56,12 +56,17 @@ fuzz_target!(|data: &[u8]| {
                         let value = (epochs[k] << 8) | u64::from(key);
                         subject.complete(value);
                         completed[k] = true;
-                        // Every live future of this generation: each
-                        // distinct registered waker fires exactly once.
+                        // Every live future of this generation: only its
+                        // latest registered waker fires exactly once.
                         for f in &futures {
                             if f.key == key && f.epoch == epochs[k] && !f.cancelled {
-                                for probe in &f.wakers {
-                                    assert_eq!(probe.count(), 1, "waker fired != once");
+                                for (i, probe) in f.wakers.iter().enumerate() {
+                                    let expected = usize::from(i + 1 == f.wakers.len());
+                                    assert_eq!(
+                                        probe.count(),
+                                        expected,
+                                        "migrated/current waker count mismatch"
+                                    );
                                 }
                             }
                         }

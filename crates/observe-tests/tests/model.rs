@@ -101,8 +101,8 @@ struct FutureHandle {
     future: Pin<Box<ObservationFuture<u64>>>,
     key: u8,
     epoch: u64,
-    /// Distinct wakers this future has registered (migration history),
-    /// each expected to fire exactly once at completion.
+    /// Waker migration history. Only the final entry remains registered;
+    /// every earlier entry must stay unwoken at completion.
     wakers: Vec<(std::task::Waker, Arc<CountWake>)>,
 }
 
@@ -396,7 +396,7 @@ fn poll_future(campaign: &mut Campaign, id: usize, migrate: bool) {
         CountWake::waker()
     } else {
         // Re-poll with the same waker: idempotent re-registration.
-        let (waker, probe) = &handle.wakers[0];
+        let (waker, probe) = handle.wakers.last().expect("non-empty waker history");
         (waker.clone(), Arc::clone(probe))
     };
     match poll_once(handle.future.as_mut(), &waker) {
@@ -421,17 +421,18 @@ fn poll_future(campaign: &mut Campaign, id: usize, migrate: bool) {
     }
 }
 
-/// After `complete`, every live future of the epoch must have each of its
-/// distinct registered wakers fired exactly once, and every pending direct
-/// registration on observations of the epoch must have fired exactly once.
+/// After `complete`, every live future of the epoch must have only its latest
+/// waker fired exactly once; migrated-away wakers must remain unwoken. Every
+/// pending direct registration still fires exactly once.
 fn assert_completion_notifications(campaign: &Campaign, key: u8, epoch: u64, value: u64) {
     for handle in campaign.harness.futures.values() {
         if handle.key == key && handle.epoch == epoch {
             for (i, (_, probe)) in handle.wakers.iter().enumerate() {
+                let expected = usize::from(i + 1 == handle.wakers.len());
                 assert_eq!(
                     probe.count(),
-                    1,
-                    "future waker {i} of key {key} epoch {epoch} fired != 1 time"
+                    expected,
+                    "future waker {i} of key {key} epoch {epoch} fired unexpectedly"
                 );
             }
         }

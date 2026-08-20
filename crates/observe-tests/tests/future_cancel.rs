@@ -192,10 +192,10 @@ fn same_waker_registered_twice_fires_once() {
 }
 
 /// A future polled with MANY distinct wakers (a pathological executor
-/// rotating wakers every poll) must register each one, fire every one
-/// exactly once at completion, and deregister every one on drop.
+/// rotating wakers every poll) retains only the current registration.
+/// Completion fires the latest waker exactly once and no migrated-away waker.
 #[test]
-fn many_distinct_wakers_fire_exactly_once_and_deregister() {
+fn many_distinct_wakers_leave_only_latest_registered() {
     const POLLS: usize = 50;
     let space = ObservationSpace::<u32, u64>::new();
     let mut subject = space.subject(31).expect("first registration succeeds");
@@ -209,9 +209,14 @@ fn many_distinct_wakers_fire_exactly_once_and_deregister() {
         probes.push(probe);
     }
     subject.complete(99);
-    for (i, probe) in probes.iter().enumerate() {
-        assert_eq!(probe.count(), 1, "waker {i} fired != once");
+    for (i, probe) in probes[..POLLS - 1].iter().enumerate() {
+        assert_eq!(probe.count(), 0, "migrated-away waker {i} fired");
     }
+    assert_eq!(
+        probes[POLLS - 1].count(),
+        1,
+        "latest waker did not fire once"
+    );
     assert_eq!(
         poll_once(f.as_mut(), &CountWake::waker().0),
         Poll::Ready(99)
