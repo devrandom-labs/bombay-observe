@@ -71,6 +71,7 @@
             cargo-edit
             cargo-deny
             cargo-audit
+            just
             taplo
             figlet
             lolcat
